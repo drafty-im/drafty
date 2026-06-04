@@ -448,7 +448,11 @@ async function login() {
       try {
         const body = (await req.json()) as { token?: string; state?: string };
         if (body.state !== state || !body.token) return json({ ok: false }, 400, origin);
-        resolveCb(body.token);
+        // Resolve on the next tick so this 200 flushes to the browser *before*
+        // the main flow stops the server — otherwise the page sees a dropped
+        // connection and shows a false error even though we got the token.
+        const tok = body.token;
+        setTimeout(() => resolveCb(tok), 50);
         return json({ ok: true }, 200, origin);
       } catch {
         return json({ ok: false }, 400, origin);
@@ -467,7 +471,7 @@ async function login() {
   let token: string;
   try { token = await got; } catch (e) { server.stop(true); return die((e as Error).message); }
   clearTimeout(timer);
-  server.stop(true);
+  server.stop(); // graceful — let the in-flight 200 finish flushing to the browser
 
   // Valid token in hand — store it first so login can't fail past this point.
   writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
