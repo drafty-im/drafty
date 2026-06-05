@@ -98,7 +98,7 @@ the update unprompted, since it changes their environment.
 | `marky list <slug> [--json] [--open]` | Snapshot every thread + comment (your reading view). `--open` hides resolved. |
 | `marky watch <slug> [--json] [--backlog]` | **Socket mode** — stream new human comments live to stdout. Run in background; surface comments to the user as they arrive. |
 | `marky inbox [slug] [--json] [--all]` | **Fresh threads that need Claude** — open, not already being worked on, latest comment from a human. Loop-safe (resolved/answered threads never reappear). A no-slug sweep only surfaces canvases set to `live`; pass a `slug` or `--all` to include `feedback` canvases too. |
-| `marky working <annotationId>` | Shimmer the thread on the canvas while you work on it. Cleared by reply/resolve. |
+| `marky working <annotationId>` | Shimmer the thread on the canvas while you work on it. Stays on through replies; cleared by resolve/reopen (or after 10 min idle). |
 | `marky reply <annotationId> "<msg>"` | Reply in a thread, authored as Claude (shows on the canvas). |
 | `marky resolve <annotationId>` / `reopen <annotationId>` | Toggle a thread's completed state. |
 | `marky pull <slug> [--revision <id>] [-o <file>]` | Download the artifact body. Content goes to stdout (newline-terminated, so it pipes/redirects cleanly); metadata to stderr. `--revision` pulls a past version; `-o`/`--out` writes a file; `--json` returns the full envelope. |
