@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
-// Cut a Drafty plugin release. Bumps the version in plugin.json, commits, tags,
-// and pushes. Users then pull it with `claude plugin marketplace update drafty-im`.
+// Cut a Marky plugin release. Bumps the version in plugin.json, commits, tags,
+// and pushes. Users then pull it with `claude plugin marketplace update marky-im`.
 //
 // Day-to-day you don't need this: a plain `git push` already ships the change
 // (Claude Code versions an un-pinned plugin by commit SHA). Use this only for an
@@ -15,7 +15,7 @@ if (!v || !/^\d+\.\d+\.\d+$/.test(v)) {
   process.exit(1);
 }
 
-const manifest = "plugins/drafty/.claude-plugin/plugin.json";
+const manifest = "plugins/marky/.claude-plugin/plugin.json";
 const j = JSON.parse(await Bun.file(manifest).text());
 const prev = j.version;
 j.version = v;
@@ -27,4 +27,4 @@ await $`git tag ${`v${v}`}`;
 await $`git push -q origin main --tags`;
 
 console.log(`✓ released v${prev} → v${v}`);
-console.log(`  users update with:  claude plugin marketplace update drafty-im`);
+console.log(`  users update with:  claude plugin marketplace update marky-im`);

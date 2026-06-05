@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Drafty launcher. While the plugin is enabled this is on the Bash tool's PATH,
-# so `drafty <command>` just works — no separate `setup` step. Runs the bundled
+# Marky launcher. While the plugin is enabled this is on the Bash tool's PATH,
+# so `marky <command>` just works — no separate `setup` step. Runs the bundled
 # Bun CLI. Requires `bun` (https://bun.sh).
 set -euo pipefail
 ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 if ! command -v bun >/dev/null 2>&1; then
-  echo "drafty: needs 'bun' on PATH — install it from https://bun.sh, then retry." >&2
+  echo "marky: needs 'bun' on PATH — install it from https://bun.sh, then retry." >&2
   exit 127
 fi
 exec bun "$ROOT/cli/canvas.ts" "$@"
