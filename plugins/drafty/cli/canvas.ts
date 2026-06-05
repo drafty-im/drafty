@@ -12,6 +12,28 @@ import { homedir } from "node:os";
 const BASE_URL = process.env.DRAFTY_BASE_URL || "https://drafty.im";
 const STATE_DIR = join(homedir(), ".drafty");
 const TOKEN_FILE = join(STATE_DIR, "token");
+// A durable marker of the last signed-in identity, kept alongside the token.
+// If the token ever goes missing while this says we were signed in, we make the
+// drop-to-guest LOUD instead of silent (see getToken / main) — so a lost session
+// can never quietly publish under a throwaway guest.
+const IDENTITY_FILE = join(STATE_DIR, "identity.json");
+type Identity = { signedIn?: boolean; email?: string; userId?: string; sessionLost?: boolean };
+
+function readIdentity(): Identity | null {
+  try { return existsSync(IDENTITY_FILE) ? JSON.parse(readFileSync(IDENTITY_FILE, "utf8")) : null; }
+  catch { return null; }
+}
+function writeIdentity(id: Identity): void {
+  try { mkdirSync(STATE_DIR, { recursive: true }); writeFileSync(IDENTITY_FILE, JSON.stringify(id), { mode: 0o600 }); }
+  catch { /* marker is best-effort; never block a command on it */ }
+}
+function clearIdentity(): void {
+  try { if (existsSync(IDENTITY_FILE)) rmSync(IDENTITY_FILE, { force: true }); } catch { /* non-fatal */ }
+}
+function warnSessionLost(email?: string): void {
+  console.error(`\x1b[33m⚠ Your Drafty session was lost — you're acting as a guest.\x1b[0m`);
+  console.error(`  Run \`drafty login\` to sign back in${email ? ` as ${email}` : ""}.`);
+}
 const ANALYTICS_ID_FILE = join(STATE_DIR, "analytics-id");
 
 // Thin analytics: a stable per-install id (the agent is its own "user") and a
@@ -130,6 +152,14 @@ async function getToken(): Promise<string> {
   if (existsSync(TOKEN_FILE)) {
     const t = readFileSync(TOKEN_FILE, "utf8").trim();
     if (t) return t;
+  }
+  // Token gone. If a marker says we were signed in, this is a lost session, not a
+  // first run — surface it loudly and remember (so later commands keep nagging
+  // until the human re-logs in) rather than silently becoming a fresh guest.
+  const id = readIdentity();
+  if (id?.signedIn) {
+    if (!id.sessionLost) writeIdentity({ ...id, sessionLost: true });
+    warnSessionLost(id.email);
   }
   const res = await fetch(`${BASE_URL}/get/api/auth`, { method: "POST" });
   const data: any = await res.json().catch(() => ({}));
@@ -530,6 +560,8 @@ async function login() {
     const me = (await meRes.json().catch(() => ({}))) as { userId?: string; email?: string };
     if (me.userId) {
       label = me.email || me.userId;
+      // Remember who we are so a future lost session can be detected (not silent).
+      writeIdentity({ signedIn: true, email: me.email, userId: me.userId, sessionLost: false });
       if (oldGuestId && me.userId !== oldGuestId) {
         const mr = await fetch(`${BASE_URL}/get/api/merge`, { method: "POST", headers: { authorization: `Bearer ${oldToken}`, "content-type": "application/json" }, body: JSON.stringify({ newCreatorId: me.userId }) });
         const md = (await mr.json().catch(() => ({}))) as { merged?: number };
@@ -550,12 +582,16 @@ function openBrowser(url: string) {
 // Drop the stored identity; the next command mints a fresh guest.
 function logout() {
   if (existsSync(TOKEN_FILE)) rmSync(TOKEN_FILE, { force: true });
+  clearIdentity(); // explicit sign-out — drop the marker so we don't warn about it
   console.error("✓ signed out — a new guest identity will be created on next use");
 }
 
 // ── setup / health ────────────────────────────────────────────────────────────
 async function whoami() {
   const r = await api("whoami", { method: "GET" });
+  // Keep the marker in step with reality: refresh it when signed in (also clears
+  // any stale session-lost flag after a re-login).
+  if (!r.isGuest) writeIdentity({ signedIn: true, email: r.email, userId: r.userId, sessionLost: false });
   console.log(`identity : ${r.isGuest ? "guest (not signed in)" : r.email || "signed in"}`);
   console.log(`user id  : ${r.userId}`);
   console.log(`canvases : ${r.canvases}`);
@@ -697,6 +733,10 @@ it into a real account in place. Point at another server with DRAFTY_BASE_URL.
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
+  // If a prior command already detected a lost session, keep it visible on every
+  // run until the human re-logs in (cheap, no network — just reads the marker).
+  const _id = readIdentity();
+  if (_id?.signedIn && _id.sessionLost) warnSessionLost(_id.email);
   switch (cmd) {
     case "push": return push(args);
     case "mode": return setMode(args);
