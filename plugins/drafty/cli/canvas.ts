@@ -158,16 +158,19 @@ async function api(op: string, opts: ApiOpts = {}): Promise<any> {
 // ── commands ────────────────────────────────────────────────────────────────
 async function push(args: string[]) {
   const file = args[0];
-  if (!file) return die("usage: drafty push <file> [--title T] [--slug S] [--mode M]");
+  if (!file) return die("usage: drafty push <file> [--title T] [--description D] [--slug S] [--mode M]");
   const content = await Bun.file(file).text();
   if (!content.trim()) return die(`file is empty: ${file}`);
   const format = inferFormat(file);
   const title = flag(args, "title") || inferTitle(content, format, file);
+  // One-line summary of the artifact for the link unfurl (og:description). The
+  // publishing agent writes this — it has the full content in context.
+  const description = flag(args, "description");
   const mode = parseMode(flag(args, "mode"));
   const slug = flag(args, "slug");
   // targetSlug = update intent (exact); newSlug = pre-hashed slug if we create.
   const r = await api("push", {
-    body: { content, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(mode ? { mode } : {}) },
+    body: { content, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(description ? { description } : {}), ...(mode ? { mode } : {}) },
   });
   if (r.created) {
     console.log(`✓ published "${r.title}"  ·  ${modeLabel[r.mode as Mode]}`);

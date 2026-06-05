@@ -49,6 +49,20 @@ the `noindex` URL unguessable. So:
 written, no path named, no single doc in focus). A quick one-line clarification beats
 publishing the wrong thing.
 
+**Always pass `--title` and `--description` when you publish.** You have the full
+artifact in context — so write the metadata that makes the shared link unfurl well,
+rather than leaving it to a filename guess:
+
+- `--title` — a real, specific title for the artifact (not the filename). Short.
+- `--description` — one sentence (~120 chars) describing what the artifact *is* and
+  what reading it gets you. This becomes `og:description` on the link preview, the
+  way Claude's public-artifact links describe themselves. Write it plainly; no
+  marketing voice. Re-pushing without `--description` keeps the existing one.
+
+The canvas link unfurls with a full-bleed screenshot of the artifact plus this
+title + description, so a good one-liner is what makes a shared canvas legible
+before anyone clicks.
+
 ## Setup
 
 Installed via the **Drafty plugin** — the `drafty` command is already on PATH in
@@ -75,7 +89,7 @@ CLI.) `drafty logout` drops back to a fresh guest.
 
 | Command | What it does |
 |---|---|
-| `drafty push <file> [--title T] [--slug S] [--mode M]` | Publish a `.md`/`.html` file → prints the URL. Re-push with `--slug` to update + snapshot a revision. New canvases default to `feedback` mode. |
+| `drafty push <file> [--title T] [--description D] [--slug S] [--mode M]` | Publish a `.md`/`.html` file → prints the URL. Re-push with `--slug` to update + snapshot a revision. New canvases default to `feedback` mode. `--description` sets the link-unfurl summary (see below). |
 | `drafty mode <slug> <readonly\|feedback\|live>` | Set how the canvas behaves when shared (see **Canvas modes** below). |
 | `drafty list <slug> [--json] [--open]` | Snapshot every thread + comment (your reading view). `--open` hides resolved. |
 | `drafty watch <slug> [--json] [--backlog]` | **Socket mode** — stream new human comments live to stdout. Run in background; surface comments to the user as they arrive. |
@@ -137,7 +151,7 @@ watch doorbell for that canvas (`Monitor` on `drafty watch <slug> --json`).
 
 **Share a draft for feedback**
 1. Write the plan/draft to a file (e.g. `/tmp/plan.md`).
-2. `drafty push /tmp/plan.md --title "Launch plan"` → give the user the URL.
+2. `drafty push /tmp/plan.md --title "Launch plan" --description "Week-by-week rollout plan for the v2 launch — owners, dates, and the go/no-go gate."` → give the user the URL.
 3. Tell them: hover any line, click to comment; mark threads done as they're addressed.
 
 **React to feedback (socket mode)**
