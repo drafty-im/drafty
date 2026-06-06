@@ -5,7 +5,7 @@
 // A thin HTTP/SSE client: it holds a per-user guest token (minted by the server,
 // stored under ~/.marky) and drives everything through the public /get/api
 // endpoints. No InstantDB dependency, no native deps — installs anywhere.
-import { basename, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 
@@ -268,6 +268,75 @@ async function api(op: string, opts: ApiOpts = {}): Promise<any> {
   die(lastErr); // unreachable — the loop always returns or dies
 }
 
+// ── asset pass ───────────────────────────────────────────────────────────────
+// On push, local image refs (<img src="./x.png">, url(./x.png)) are uploaded to
+// marky's object store and rewritten to served URLs in the *published* content.
+// The on-disk file is left untouched, so it stays small and Read/Edit-able for
+// the agent instead of bloating with base64. Remote/data:/already-hosted refs
+// are left alone. The bytes go to /get/api/asset — the CLI never holds the store
+// token (consistent with every other op).
+const ASSET_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "avif"]);
+const ASSET_CONTENT_TYPE: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", svg: "image/svg+xml", avif: "image/avif",
+};
+
+function refExt(ref: string): string {
+  return (ref.split(/[?#]/)[0].split(".").pop() || "").toLowerCase();
+}
+
+function isLocalAssetRef(ref: string): boolean {
+  if (!ref) return false;
+  if (/^(https?:)?\/\//i.test(ref)) return false; // remote or protocol-relative
+  if (/^data:/i.test(ref)) return false; // already inline
+  if (ref.startsWith("#")) return false; // svg fragment / in-page anchor
+  return ASSET_EXTS.has(refExt(ref));
+}
+
+async function uploadAssetBytes(bytes: Uint8Array, ext: string): Promise<string> {
+  const token = await getToken();
+  const res = await fetch(`${BASE_URL}/get/api/asset?ext=${encodeURIComponent(ext)}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": ASSET_CONTENT_TYPE[ext] || "application/octet-stream" },
+    body: bytes,
+  });
+  const data: any = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) die(data.error || `asset upload failed (${res.status})`);
+  return data.url as string;
+}
+
+// Upload every local image ref once, then rewrite only within matched <img src>
+// / url(...) contexts so a filename can't accidentally match elsewhere.
+async function uploadLocalAssets(content: string, file: string): Promise<string> {
+  const imgRe = /<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi;
+  const cssRe = /url\(\s*["']?([^"')]+?)["']?\s*\)/gi;
+  const refs = new Set<string>();
+  for (const re of [imgRe, cssRe]) {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(content))) if (isLocalAssetRef(m[1].trim())) refs.add(m[1].trim());
+  }
+  if (!refs.size) return content;
+
+  const dir = dirname(resolve(file));
+  const map = new Map<string, string>();
+  for (const ref of refs) {
+    const path = resolve(dir, ref.split(/[?#]/)[0]);
+    const f = Bun.file(path);
+    if (!(await f.exists())) { console.error(`  ⚠ skipping missing asset: ${ref}`); continue; }
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    const url = await uploadAssetBytes(bytes, refExt(ref));
+    map.set(ref, url);
+    console.log(`  ⬆ ${ref}`);
+  }
+  if (!map.size) return content;
+
+  const rewrite = (full: string, ref: string) =>
+    map.has(ref.trim()) ? full.replace(ref, map.get(ref.trim())!) : full;
+  return content
+    .replace(/<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi, rewrite)
+    .replace(/url\(\s*["']?([^"')]+?)["']?\s*\)/gi, rewrite);
+}
+
 // ── commands ────────────────────────────────────────────────────────────────
 async function push(args: string[]) {
   const file = args[0];
@@ -278,9 +347,12 @@ async function push(args: string[]) {
   const title = flag(args, "title") || inferTitle(content, format, file);
   const mode = parseMode(flag(args, "mode"));
   const slug = flag(args, "slug");
+  // Upload local images → served URLs in the published copy; the file on disk is
+  // left as-is (small + editable). Titles are inferred from the original content.
+  const published = await uploadLocalAssets(content, file);
   // targetSlug = update intent (exact); newSlug = pre-hashed slug if we create.
   const r = await api("push", {
-    body: { content, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(mode ? { mode } : {}) },
+    body: { content: published, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(mode ? { mode } : {}) },
   });
   if (r.created) {
     console.log(`✓ published "${r.title}"  ·  ${modeLabel[r.mode as Mode]}`);
