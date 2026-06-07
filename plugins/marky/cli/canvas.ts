@@ -862,6 +862,15 @@ function installLauncher(cliDir: string): { path: string; binDir: string; onPath
   return { path: launcher, binDir, onPath: pathDirs.includes(binDir) };
 }
 
+// What shipped, by week. Public feed — no token. The server renders the
+// ready-to-print text; --json passes the structured weeks through.
+async function changelog(args: string[]) {
+  const wantJson = has(args, "json");
+  const res = await fetch(`${BASE_URL}/get/api/changelog${wantJson ? "" : "?format=text"}`);
+  if (!res.ok) return die(`changelog failed (${res.status})`);
+  process.stdout.write(await res.text());
+}
+
 const HELP = `marky — share docs for annotation, read & reply to feedback
 
   marky push <file> [--title T] [--slug S] [--mode M]   publish/update a doc
@@ -877,6 +886,7 @@ const HELP = `marky — share docs for annotation, read & reply to feedback
   marky reopen <annotationId>                reopen a thread
   marky restore <slug> <revisionId>          restore the doc to a past version
   marky docs                                 list your canvases
+  marky changelog [--json]                   what shipped, by week
   marky claim <slug>                         keep a provisional canvas (MARKY_TOKEN=<provision token>)
 
   marky login                                sign in (opens your browser; signs in web + CLI)
@@ -923,6 +933,7 @@ async function main() {
     case "setup": return setup();
     case "doctor": return doctor();
     case "whoami": case "me": return whoami();
+    case "changelog": case "whatsnew": return changelog(args);
     default:
       console.log(HELP);
       if (cmd && !["help", "--help", "-h"].includes(cmd)) process.exit(1);

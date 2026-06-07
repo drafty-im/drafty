@@ -105,6 +105,7 @@ the update unprompted, since it changes their environment.
 | `marky versions <slug> [--json]` | List a canvas's versions, newest first — each with its revision id, time, author, and note. Feed an id into `marky pull --revision` or `marky restore`. |
 | `marky restore <slug> <revisionId>` | Roll the doc back to a past version (revision ids come from `marky versions` or the web History panel). |
 | `marky docs` | List your canvases. |
+| `marky changelog [--json]` | What shipped on Marky, grouped by week (public feed; no sign-in needed). Use when the human asks "what's new in marky". |
 | `marky login` | Sign the human in — opens their browser; one sign-in covers web + CLI, and any canvases made before signing in fold into the account. `marky logout` signs out. |
 | `marky claim <slug>` | Take ownership of a *provisional* canvas (one minted by `/get/provision`) so it stops being ephemeral and lists under the human's account. Requires being signed in (`marky login` first); authorize the transfer with the canvas's provision token: `MARKY_TOKEN=<provision token> marky claim <slug>`. Only when the human asks to keep it. |
 
