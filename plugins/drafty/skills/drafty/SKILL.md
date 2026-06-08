@@ -53,6 +53,27 @@ the `noindex` URL unguessable. So:
 written, no path named, no single canvas in focus). A quick one-line clarification beats
 publishing the wrong thing.
 
+## Markdown or HTML — match the format to the ask
+
+A canvas can be either. **Pick by what the user wants to look at, not by reflex.**
+
+- **HTML when the ask is visual** — anything the user needs to *see* rather than
+  read: a UI mockup, a screen, a layout, a design, a prototype, colour/spacing/
+  typography, a comparison of options side by side, "show me", "make it look like".
+  If the value is in the pixels, write HTML and lay it out for real. A wall of prose
+  *describing* a design is the wrong artifact — render the design.
+- **Markdown when the ask is words** — plans, drafts, specs, research, notes, copy
+  decks, anything whose value is the text. This is the default for non-visual work.
+
+**Already wrote `.md` and the user then asks to see it / "make it visual" / "show me"?**
+That's the signal to re-author as a self-contained `.html` file and push that — don't
+patch prose onto a Markdown canvas. (Archive or replace the Markdown one so the
+visual version is the canonical canvas.)
+
+HTML canvases are plain self-contained files: inline `<style>`, no build step, no
+external JS needed. Element anchoring works the same — `prepareDoc` bakes the
+comment anchors in, so write normal semantic HTML and don't hand-add anything.
+
 ## Setup
 
 Installed via the **Drafty plugin** — the `drafty` command is already on PATH in
@@ -247,7 +268,8 @@ PATH, token, server — it never touches canvas data.)
 ## Typical workflows
 
 **Share a draft for feedback**
-1. Write the plan/draft to a file (e.g. `/tmp/plan.md`).
+1. Write the draft to a file — `.md` for text, `.html` for anything visual (see
+   **Markdown or HTML** above), e.g. `/tmp/plan.md` or `/tmp/mockup.html`.
 2. `drafty canvas push /tmp/plan.md --title "Launch plan"` → give the user the URL.
 3. Tell them: hover any line, click to comment; mark threads done as they're addressed.
 
