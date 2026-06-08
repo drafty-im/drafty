@@ -414,7 +414,9 @@ async function canvasPush(args: string[]) {
     console.log(`✓ updated "${r.title}"`);
     if (mode) console.log(`  ${modeLine(mode, r.slug)}`);
   }
-  console.log(`  ${url(r.slug)}`);
+  // ?ref=cli attributes views of a freshly-published link back to the CLI publish
+  // (the start of the creator→commenter→creator loop).
+  console.log(`  ${url(r.slug)}?ref=cli`);
 
   // Organize at publish time: any --project/--tag flags are applied in a single
   // setmeta call, so the agent files a canvas under its initiative + kind as it
