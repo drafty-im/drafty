@@ -146,7 +146,13 @@ function slugify(title: string): string {
     .replace(/-+$/, "");
   return `${base || "canvas"}-${shortHash()}`;
 }
-function inferFormat(file: string): "markdown" | "html" {
+function inferFormat(file: string, content: string): "markdown" | "html" {
+  // Content wins over extension. A full HTML document pushed from a non-.html file
+  // (e.g. the default `canvas pull -o x.txt` → edit → push loop) must not be
+  // silently downgraded to markdown — that flips the stored format and renders the
+  // raw <html> as text, blanking the canvas. Only a document that *opens* with a
+  // doctype/<html> counts; markdown that merely embeds a <div> stays markdown.
+  if (/^﻿?\s*<(?:!doctype\s+html|html[\s>])/i.test(content)) return "html";
   return /\.html?$/i.test(file) ? "html" : "markdown";
 }
 function inferTitle(content: string, format: string, file: string): string {
@@ -388,10 +394,14 @@ async function uploadLocalAssets(content: string, file: string): Promise<string>
 // ── commands ────────────────────────────────────────────────────────────────
 async function canvasPush(args: string[]) {
   const file = args[0];
-  if (!file) return die("usage: drafty canvas push <file> [--title T] [--slug S] [--mode M] [--project P] [--status S] [--tag T …]");
+  if (!file) return die("usage: drafty canvas push <file> [--title T] [--slug S] [--mode M] [--format html|markdown] [--project P] [--status S] [--tag T …]");
   const content = await Bun.file(file).text();
   if (!content.trim()) return die(`file is empty: ${file}`);
-  const format = inferFormat(file);
+  // --format html|markdown is an explicit override; otherwise sniff content+extension.
+  const formatFlag = flag(args, "format");
+  if (formatFlag !== undefined && formatFlag !== "html" && formatFlag !== "markdown")
+    return die(`--format must be html or markdown (got "${formatFlag}")`);
+  const format = (formatFlag as "html" | "markdown" | undefined) ?? inferFormat(file, content);
   const title = flag(args, "title") || inferTitle(content, format, file);
   const mode = parseMode(flag(args, "mode"));
   const slug = flag(args, "slug");
