@@ -137,7 +137,10 @@ the update unprompted, since it changes their environment.
 | `drafty comments resolve <annotationId>` / `reopen <annotationId>` | Toggle a thread's completed state. |
 | `drafty canvas pull <slug> [--revision <id>] [-o <file>]` | Download the artifact body. Content goes to stdout (newline-terminated, so it pipes/redirects cleanly); metadata to stderr. `--revision` pulls a past version; `-o`/`--out` writes a file; `--json` returns the full envelope. |
 | `drafty canvas versions <slug> [--json]` | List a canvas's versions, newest first — each with its revision id, time, author, and note. Feed an id into `drafty canvas pull --revision` or `drafty canvas restore`. |
-| `drafty canvas restore <slug> <revisionId>` | Roll the canvas back to a past version (revision ids come from `drafty canvas versions` or the web History panel). |
+| `drafty canvas restore <slug> <revisionId>` | Roll the canvas back to a past version — **server only**; the local file does not change. For undo, prefer `revert` (below), which resyncs both. |
+| `drafty canvas revert <file\|slug> [--to <revisionId>]` | **The undo.** Atomically: restore the canvas (default: one revision back) AND rewrite the local file to match + update the manifest. Never hand-edit a file back to undo — a later push would re-introduce what the canvas reverted. |
+| `drafty canvas status <file>` | Sync report for a pushed file: `in-sync` / `local-ahead` (file edited since last push) / `canvas-ahead` (canvas moved — browser edit, restore, another agent) / `diverged` (both). Check before pushing when in doubt. |
+| `drafty shot <slug>\|<file.html>\|<url> [--width N] [--revision <id>] [--annotation <id>] [--full] [-o out]` | **Render to an image and print its path** — your eyes. A local file/URL renders via headless Chrome on this machine; a public canvas renders via the server (cached per revision×width); a private canvas auto-falls back to rendering pulled content locally. `--annotation <id>` reproduces a commenter's exact view (their width + revision, anchored element highlighted). Read the printed path to *see* it. |
 | `drafty context [--limit N] [--archived] [--json]` | **Orientation in one call** — identity, local git repo/branch, the projects + tags already in use (with counts), and the most-recent canvases (capped to ~15; `--limit 0` for all). Run it before a push/update to pick the project, reuse tags, and decide create-vs-update. |
 | `drafty canvas ls [--project P] [--tag T] [--unfiled] [--archived] [--json]` | The filtered / full list — **newest first**, the same order as the web home and `drafty context`, each row showing project · `#tags` · open-thread count. Orient with `drafty context` first; reach for `ls` to **drill in or filter**: `--project "<name>"`, `--tag <label>`, `--unfiled` (missing a project or tags), `--archived`. |
 | `drafty changelog [--json]` | What shipped on Drafty, grouped by week (public feed; no sign-in needed). Use when the human asks "what's new in drafty". |
@@ -327,6 +330,41 @@ the point renders too small to read on a very large image, *additionally* crop
 So "the number in the top-right looks wrong" on a screenshot is actionable: you
 see the image, you know the spot is `top-right (78%,22%)`, you fix that number.
 
+**Visual feedback — reproduce before you edit (agent eyes)**
+When a comment is about *appearance* — squished, cramped, overlapping, cut off,
+misaligned, "looks off", "broken on my phone" — **do not edit from the text
+alone**. The anchored element tells you where they clicked, not what they saw.
+The loop:
+
+1. Read the thread's reproduction context from `drafty comments ls/inbox --json`:
+   `viewportW` (their layout width — the load-bearing number), `anchorRect`,
+   `canvasRevisionId` (the version they were looking at).
+2. **See it:** `drafty shot <slug> --annotation <annId>` renders the commenter's
+   exact view — their width, their revision, the anchored element highlighted —
+   and prints an image path. Read it.
+3. **Staleness check:** if `canvasRevisionId` isn't the current head, the
+   feedback predates the current version — say so in your reply instead of
+   "fixing" something that may already have moved.
+4. Make the fix in the source file.
+5. **Verify before claiming:** `drafty shot <file.html> --width <their width>`
+   on the local file (or re-shot the canvas after pushing). Never claim a visual
+   fix you haven't re-rendered.
+6. Push, reply, resolve.
+
+**The anchor is a hint, not necessarily the culprit.** Reviewers click the
+nearest element; the root cause is often a sibling/ancestor/container. If the
+comment text doesn't match the anchored element, widen scope — the shot shows
+you the surrounding layout for exactly this reason.
+
+Threads created before this capture shipped have no `viewportW` — fall back to
+`drafty shot <slug> --width 390` (phone) and `--width 1280` (desktop) to check
+both ends.
+
+**See your own work before pushing.** `drafty shot mock.html --width 390` works
+on any local HTML file with no server and no auth — render what you just wrote,
+look at it, then publish. For visual artifacts this should be routine, not
+exceptional.
+
 **Autonomous mode — wake on events, handle in an active session**
 The handler is an **active Claude Code session** — no `claude -p`, no API calls.
 The trick is to keep *detection* out of the model: a comment arriving is a free,
@@ -373,9 +411,18 @@ to obey.)
   shift where old pins land — resolve threads you've addressed so they collapse.
 - Mark a thread complete only after the change is actually published.
 - Comments you post are clearly attributed to "Claude" (purple) on the canvas.
-- **Undo requests.** If someone asks to undo/revert a change and you can identify
-  it — you made it this session, or the History makes it clear — revert it and
-  re-push, then say what you reverted. If you *can't* confidently tell which change
-  they mean or reconstruct the prior state (e.g. a different session made it),
-  don't guess or claim you undid it — reply plainly that you can't undo it
-  reliably and ask them to point at the version in the History panel.
+- **Push remembers the canvas.** The first push writes `.drafty/manifest.json`
+  (repo-rooted, self-gitignored) binding the file to its slug — so a later
+  `drafty canvas push <file>` with no `--slug` updates the same canvas instead
+  of creating a new one. Push also sends the last-synced rev: if the canvas
+  moved since (a browser edit, a restore, another agent), the push is **refused
+  with instructions** instead of clobbering — `drafty canvas pull <slug> -o
+  <file>` to take theirs, or `push --force` to overwrite. `drafty canvas status
+  <file>` reports the sync state any time.
+- **Undo requests.** `drafty canvas revert <file>` is the undo: it restores the
+  canvas (one revision back, or `--to <revisionId>`) AND rewrites the local file
+  to match, atomically — **never hand-edit a file back to undo**, and never use
+  bare `restore` for undo (it leaves the local file ahead; the next push would
+  re-introduce what you reverted). If you can't confidently tell which change
+  they mean (e.g. a different session made it), don't guess — reply plainly and
+  ask them to point at the version in the History panel.

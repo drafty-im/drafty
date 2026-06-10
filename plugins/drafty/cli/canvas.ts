@@ -7,7 +7,7 @@
 // endpoints. No InstantDB dependency, no native deps — installs anywhere.
 import { basename, dirname, join, resolve } from "node:path";
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, chmodSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 const BASE_URL = process.env.DRAFTY_BASE_URL || "https://drafty.im";
 const STATE_DIR = join(homedir(), ".drafty");
@@ -421,6 +421,61 @@ async function uploadLocalAssets(content: string, file: string): Promise<string>
     .replace(/url\(\s*["']?([^"')]+?)["']?\s*\)/gi, rewrite);
 }
 
+// ── local↔canvas manifest (agent-eyes S1) ───────────────────────────────────
+// .drafty/manifest.json at the repo root (nearest .git above the pushed file;
+// the file's own directory when not in a repo). Maps a root-relative file path
+// → { slug, lastRev, lastRevisionId, lastPushedHash }, so:
+//   • `push <file>` with no --slug updates the SAME canvas next time,
+//   • push can send baseRev (the divergence guard: refuse to clobber a canvas
+//     that moved under us — browser edit, restore, another agent),
+//   • `revert`/`status` know which canvas a file binds to and what was synced.
+// The directory ships its own `.gitignore` (`*`), so it never needs an entry in
+// the user's — git ignores it natively.
+type ManifestEntry = { slug: string; lastRev: number | null; lastRevisionId: string | null; lastPushedHash: string | null };
+
+function contentHash(content: string): string {
+  return new Bun.CryptoHasher("sha256").update(content).digest("hex");
+}
+function manifestRootFor(file: string): string {
+  let dir = dirname(resolve(file));
+  for (let d = dir; ; ) {
+    if (existsSync(join(d, ".git"))) return d;
+    const up = dirname(d);
+    if (up === d) return dir;
+    d = up;
+  }
+}
+function manifestFileFor(root: string): string {
+  return join(root, ".drafty", "manifest.json");
+}
+function readManifest(root: string): Record<string, ManifestEntry> {
+  try {
+    const p = manifestFileFor(root);
+    return existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : {};
+  } catch { return {}; }
+}
+function manifestKey(root: string, file: string): string {
+  const abs = resolve(file);
+  return abs.startsWith(root + "/") ? abs.slice(root.length + 1) : abs;
+}
+function manifestLookup(file: string): { root: string; key: string; entry: ManifestEntry | null } {
+  const root = manifestRootFor(file);
+  const key = manifestKey(root, file);
+  return { root, key, entry: readManifest(root)[key] ?? null };
+}
+function writeManifestEntry(file: string, entry: ManifestEntry): void {
+  try {
+    const root = manifestRootFor(file);
+    const dir = join(root, ".drafty");
+    mkdirSync(dir, { recursive: true });
+    const ignore = join(dir, ".gitignore");
+    if (!existsSync(ignore)) writeFileSync(ignore, "*\n");
+    const all = readManifest(root);
+    all[manifestKey(root, file)] = entry;
+    writeFileSync(manifestFileFor(root), JSON.stringify(all, null, 2) + "\n");
+  } catch { /* the manifest is a convenience — never fail the command on it */ }
+}
+
 // ── commands ────────────────────────────────────────────────────────────────
 async function canvasPush(args: string[]) {
   const file = args[0];
@@ -435,7 +490,13 @@ async function canvasPush(args: string[]) {
   const title = flag(args, "title") || inferTitle(content, format, file);
   const mode = parseMode(flag(args, "mode"));
   const visibility = parseVisibility(args);
-  const slug = flag(args, "slug");
+  // Slug: an explicit --slug wins; otherwise the manifest remembers which canvas
+  // this file published to, so a bare re-push updates instead of forking a new
+  // canvas under a fresh hash.
+  const mf = manifestLookup(file);
+  const slugFlag = flag(args, "slug");
+  const slug = slugFlag ?? mf.entry?.slug;
+  if (!slugFlag && mf.entry?.slug) console.error(`  ↪ updating ${mf.entry.slug} (from .drafty/manifest.json)`);
   // Organize flags, parsed up front so a bad value fails before anything publishes.
   const project = flag(args, "project");
   const tags = multiFlag(args, "tag");
@@ -443,12 +504,38 @@ async function canvasPush(args: string[]) {
   // server stamps the canvas as self-refreshing; arming a new one is the free-plan
   // gate (free includes 1), and re-pushes to an armed canvas always pass.
   const refresh = has(args, "refresh");
+  // Divergence guard (agent-eyes S3): send the rev counter we last synced so the
+  // server refuses to clobber a canvas that moved (browser edit, restore,
+  // another agent). --force skips it; refreshes and manifest-less pushes never
+  // send one, so their behavior is unchanged.
+  const force = has(args, "force");
+  const baseRev = !force && !refresh && mf.entry && mf.entry.slug === slug && mf.entry.lastRev != null ? mf.entry.lastRev : undefined;
   // Upload local images → served URLs in the published copy; the file on disk is
   // left as-is (small + editable). Titles are inferred from the original content.
   const published = await uploadLocalAssets(content, file);
   // targetSlug = update intent (exact); newSlug = pre-hashed slug if we create.
   const r = await api("canvas.push", {
-    body: { content: published, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(mode ? { mode } : {}), ...(visibility ? { visibility } : {}), ...(refresh ? { refresh: true } : {}) },
+    body: { content: published, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(mode ? { mode } : {}), ...(visibility ? { visibility } : {}), ...(refresh ? { refresh: true } : {}), ...(baseRev != null ? { baseRev } : {}) },
+  });
+  if (r.diverged) {
+    const who = r.headAuthorKind === "human" ? `${r.headAuthor} (in the browser)` : r.headAuthor || "someone";
+    const when = r.headAt ? ` ${relTime(r.headAt)}` : "";
+    return die(
+      `canvas moved since your last sync (rev ${r.baseRev} → ${r.rev}) — last write by ${who}${when}.\n` +
+      `  pushing now would overwrite their changes. either:\n` +
+      `    drafty canvas pull ${r.slug} -o ${file}   # take the canvas's version\n` +
+      `    drafty canvas push ${file} --force        # overwrite it with yours`,
+    );
+  }
+  // Record what we just synced: slug (bare re-push targets the same canvas),
+  // rev/revisionId (the guard's base next time), and the local content hash
+  // (status's local-ahead check). Servers predating rev/revisionId return
+  // undefined — store nulls and the guard simply stays off.
+  writeManifestEntry(file, {
+    slug: r.slug,
+    lastRev: r.rev ?? null,
+    lastRevisionId: r.revisionId ?? mf.entry?.lastRevisionId ?? null,
+    lastPushedHash: contentHash(content),
   });
   if (r.created) {
     console.log(`✓ published "${r.title}"  ·  ${modeLabel[r.mode as Mode]}`);
@@ -506,6 +593,7 @@ async function commentsLs(args: string[]) {
   for (const a of anns) {
     console.log(`[${a.status === "completed" ? "✓ done" : "● open"}] ${anchorLabel(a)}`);
     console.log(`  ann: ${a.id}`);
+    if (a.viewportW) console.log(`  view: ${a.viewportW}px${a.canvasRevisionId ? ` @ rev ${String(a.canvasRevisionId).slice(0, 8)}` : ""} — see it: drafty shot ${slug} --annotation ${a.id}`);
     for (const c of a.comments) console.log(`  · ${c.authorName} (${c.authorKind}): ${c.body}`);
     console.log();
   }
@@ -541,6 +629,202 @@ async function canvasRestore(args: string[]) {
   if (!slug || !revisionId) return die("usage: drafty canvas restore <slug> <revisionId>");
   await api("canvas.restore", { body: { slug, revisionId } });
   console.log(`✓ restored ${slug} to revision ${revisionId}`);
+  console.log(`  note: this restored the canvas only. if a local file tracks it, prefer \`drafty canvas revert <file>\` — it resyncs the file too.`);
+}
+
+// Atomic undo (agent-eyes S2): server restore + pull the restored body + rewrite
+// the local file + update the manifest — one command, both sides in sync. The
+// hand-revert footgun (restore is server-only, the next push silently re-
+// introduces the reverted content) stops being possible to motivate.
+async function canvasRevert(args: string[]) {
+  const target = args[0];
+  if (!target || target.startsWith("--")) return die("usage: drafty canvas revert <file|slug> [--to <revisionId>]");
+  const isFile = existsSync(target);
+  let slug: string;
+  let file: string | null = null;
+  if (isFile) {
+    const mf = manifestLookup(target);
+    if (!mf.entry?.slug) return die(`${target} has no manifest entry — push it once first (or revert by slug: drafty canvas revert <slug>)`);
+    slug = mf.entry.slug;
+    file = target;
+  } else {
+    slug = target;
+  }
+  let to = flag(args, "to");
+  if (!to) {
+    // Default = the previous revision: index 1 of the newest-first listing
+    // (index 0 is the current head).
+    const v = await api("canvas.versions", { method: "GET", query: { slug } });
+    const prev = (v.revisions as any[])?.[1];
+    if (!prev) return die(`${slug} has no previous revision to revert to`);
+    to = prev.id;
+  }
+  const r = await api("canvas.restore", { body: { slug, revisionId: to } });
+  const pulled = await api("canvas.pull", { method: "GET", query: { slug, revisionId: to as string } });
+  if (file) {
+    writeFileSync(file, pulled.content.endsWith("\n") ? pulled.content : pulled.content + "\n");
+    writeManifestEntry(file, {
+      slug,
+      lastRev: r.rev ?? null,
+      lastRevisionId: r.newRevisionId ?? null,
+      lastPushedHash: contentHash(pulled.content.endsWith("\n") ? pulled.content : pulled.content + "\n"),
+    });
+    console.log(`✓ reverted ${slug} to revision ${to} — canvas AND ${file} now match`);
+  } else {
+    console.log(`✓ reverted ${slug} to revision ${to} (canvas only — no local file tracks this slug here)`);
+  }
+  console.log(`  ${url(slug)}`);
+}
+
+// Git-style sync report (agent-eyes S3): where the local file stands relative
+// to the canvas. in-sync / local-ahead (edited since last push) / canvas-ahead
+// (canvas moved: browser edit, restore, another agent) / diverged (both).
+async function canvasStatus(args: string[]) {
+  const file = args[0];
+  if (!file || file.startsWith("--")) return die("usage: drafty canvas status <file>");
+  if (!existsSync(file)) return die(`no such file: ${file}`);
+  const mf = manifestLookup(file);
+  if (!mf.entry?.slug) return die(`${file} has no manifest entry — it hasn't been pushed from here yet`);
+  const entry = mf.entry;
+  const content = await Bun.file(file).text();
+  const localDirty = entry.lastPushedHash != null && contentHash(content) !== entry.lastPushedHash;
+  const v = await api("canvas.versions", { method: "GET", query: { slug: entry.slug } });
+  const canvasMoved = entry.lastRev != null && v.rev != null && v.rev !== entry.lastRev;
+  const state = localDirty && canvasMoved ? "diverged" : localDirty ? "local-ahead" : canvasMoved ? "canvas-ahead" : "in-sync";
+  console.log(`${file} ↔ ${entry.slug}: ${state}`);
+  if (state === "local-ahead") console.log(`  the file changed since the last push — \`drafty canvas push ${file}\` to publish`);
+  if (state === "canvas-ahead") {
+    const head = (v.revisions as any[])?.[0];
+    if (head) console.log(`  canvas moved (rev ${entry.lastRev} → ${v.rev}) — last write by ${head.authorName} ${relTime(head.createdAt)}`);
+    console.log(`  \`drafty canvas pull ${entry.slug} -o ${file}\` to take it, or push --force to overwrite`);
+  }
+  if (state === "diverged") console.log(`  BOTH sides changed — pull to a scratch file and merge by hand, or push --force to overwrite the canvas`);
+  if (has(args, "json")) console.log(JSON.stringify({ file, slug: entry.slug, state, lastRev: entry.lastRev, canvasRev: v.rev ?? null }));
+}
+
+// ── drafty shot (agent-eyes R4): render-to-image, the agent's eyes ──────────
+// One command, three targets:
+//   • a local .html file or any URL → headless Chrome on this machine
+//   • a public canvas slug → the server render service (Firecrawl, cached on Blob)
+//   • a private canvas slug → pull the content (token-bearing) and render it
+//     locally, so private pixels never transit the crawler or public storage
+// Prints the image path on stdout so an agent can immediately Read it.
+function findChrome(): string | null {
+  const cands = [
+    process.env.DRAFTY_CHROME,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+  ].filter(Boolean) as string[];
+  for (const c of cands) if (existsSync(c)) return c;
+  return null;
+}
+
+// Jump finite CSS animations to their end state + disable transitions, so the
+// same content always shoots the same settled frame (matches the server's
+// ?freeze=1 behavior).
+const FREEZE_CSS = "<style>*{animation-delay:-10000s!important;animation-play-state:paused!important;transition:none!important}</style>";
+
+async function localShot(target: string, opts: { width: number; height: number; out: string }): Promise<void> {
+  const chrome = findChrome();
+  if (!chrome) die("no Chrome/Chromium found for local rendering — set DRAFTY_CHROME to a browser binary");
+  let src = target;
+  let tmp: string | null = null;
+  if (existsSync(target)) {
+    let html = readFileSync(resolve(target), "utf8");
+    html = html.includes("</head>") ? html.replace("</head>", FREEZE_CSS + "</head>") : FREEZE_CSS + html;
+    tmp = join(tmpdir(), `drafty-shot-src-${process.pid}-${Math.random().toString(36).slice(2, 8)}.html`);
+    writeFileSync(tmp, html);
+    src = "file://" + tmp;
+  }
+  // A throwaway profile dir: without it the spawn can block on the running
+  // Chrome's profile lock (it tries to join the existing instance) instead of
+  // rendering headlessly.
+  const profile = join(tmpdir(), `drafty-shot-profile-${process.pid}`);
+  const proc = Bun.spawnSync(
+    [chrome, "--headless=new", "--hide-scrollbars", "--no-first-run", "--disable-extensions", `--user-data-dir=${profile}`, `--window-size=${opts.width},${opts.height}`, `--screenshot=${opts.out}`, src],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  if (tmp) rmSync(tmp, { force: true });
+  rmSync(profile, { recursive: true, force: true });
+  if (!existsSync(opts.out)) die(`chrome render failed: ${new TextDecoder().decode(proc.stderr).slice(-400)}`);
+}
+
+async function shot(args: string[]) {
+  const target = args[0];
+  if (!target || target.startsWith("--"))
+    return die("usage: drafty shot <slug|file.html|url> [--width N] [--height N] [--revision R] [--annotation A] [--full] [-o out]");
+  const widthFlag = flag(args, "width");
+  const heightFlag = flag(args, "height");
+  const full = has(args, "full");
+  const annotationId = flag(args, "annotation");
+  const revisionId = flag(args, "revision") ?? flag(args, "rev");
+  const outIdx = args.indexOf("-o");
+  let out = (outIdx >= 0 ? args[outIdx + 1] : undefined) ?? flag(args, "out");
+
+  // Local file / arbitrary URL — no server involved. The see-before-push loop:
+  // render the mockup you just wrote, look at it, then publish.
+  if (existsSync(target) || /^https?:\/\//.test(target)) {
+    const width = widthFlag ? Number(widthFlag) : 390;
+    // --full has no real meaning without knowing content height; a tall window
+    // approximates it for local shots.
+    const height = heightFlag ? Number(heightFlag) : full ? 4000 : 844;
+    out = out ?? join(tmpdir(), `drafty-shot-${Date.now()}-${width}.png`);
+    await localShot(target, { width, height, out });
+    console.log(out);
+    return;
+  }
+
+  // Canvas slug → the render service (public canvases; rendered once per
+  // (revision, width, crop), cached forever on Blob).
+  const slug = target;
+  const query: Record<string, string> = { slug };
+  if (widthFlag) query.width = widthFlag;
+  if (heightFlag) query.height = heightFlag;
+  if (revisionId) query.revisionId = revisionId;
+  if (annotationId) query.annotationId = annotationId;
+  if (full) query.full = "1";
+  const r = await api("canvas.render", { method: "GET", query });
+
+  if (r.private) {
+    // Private canvas: render the pulled content locally instead.
+    console.error(`  ${slug} is ${r.visibility} — rendering locally from pulled content`);
+    let annRevision = revisionId;
+    let width = widthFlag ? Number(widthFlag) : 390;
+    if (annotationId) {
+      const ls = await api("comments.ls", { method: "GET", query: { slug } });
+      const ann = (ls.annotations as any[]).find((a) => a.id === annotationId);
+      if (ann?.viewportW) width = Math.round(ann.viewportW);
+      if (!annRevision && ann?.canvasRevisionId) annRevision = ann.canvasRevisionId;
+      console.error("  note: the local fallback renders the page without the anchor highlight");
+    }
+    const pulled = await api("canvas.pull", { method: "GET", query: { slug, ...(annRevision ? { revisionId: annRevision } : {}) } });
+    if (pulled.format === "markdown")
+      console.error("  note: markdown renders approximately here (plain text, not the canvas styling)");
+    const body =
+      pulled.format === "markdown"
+        ? `<!doctype html><meta charset="utf-8"><body style="max-width:768px;margin:2rem auto;padding:0 1rem;font-family:ui-sans-serif,system-ui;line-height:1.6;white-space:pre-wrap">${pulled.content.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</body>`
+        : pulled.content;
+    const tmpHtml = join(tmpdir(), `drafty-shot-pull-${process.pid}.html`);
+    writeFileSync(tmpHtml, body);
+    out = out ?? join(tmpdir(), `drafty-shot-${slug}-${width}.png`);
+    await localShot(tmpHtml, { width, height: heightFlag ? Number(heightFlag) : full ? 4000 : 844, out });
+    rmSync(tmpHtml, { force: true });
+    console.log(out);
+    return;
+  }
+
+  // Download the stored render so the agent can Read it from a local path.
+  out = out ?? join(tmpdir(), `drafty-shot-${slug}-${r.width}${annotationId ? `-${String(annotationId).slice(0, 8)}` : ""}.jpg`);
+  const res = await fetch(r.url);
+  if (!res.ok) die(`fetching render failed: ${res.status}`);
+  await Bun.write(out, await res.arrayBuffer());
+  console.error(`  ${r.cached ? "cache hit" : "rendered"} · ${r.width}px${r.revisionId ? ` · revision ${r.revisionId}` : ""} · ${r.url}`);
+  console.log(out);
+  await track("canvas.shot", { slug, width: r.width, cached: !!r.cached, annotation: !!annotationId });
 }
 
 // Download the artifact body. Content goes to stdout (newline-terminated) so it
@@ -711,6 +995,7 @@ async function commentsInbox(args: string[]) {
   for (const it of items) {
     console.log(`• ${it.slug} — ${anchorLabel(it)}`);
     console.log(`  ${it.lastAuthor}: ${it.lastComment}`);
+    if (it.viewportW) console.log(`  view: ${it.viewportW}px — see it: drafty shot ${it.slug} --annotation ${it.annotationId}`);
     console.log(`  ann: ${it.annotationId}\n`);
   }
   if (!slug && !has(args, "all") && r.parked) {
@@ -1255,7 +1540,9 @@ CANVAS — the canvas you publish
   drafty canvas versions <slug> [--json]   list a canvas's versions, newest first
   drafty marks ls <slug> [--kind k] [--json]  marks on a live canvas (done/saved row state)
   drafty marks rm <markId>                 remove a mark
-  drafty canvas restore <slug> <revisionId>   restore to a past version
+  drafty canvas restore <slug> <revisionId>   restore to a past version (server only)
+  drafty canvas revert <file|slug> [--to revisionId]   undo: restore AND resync the local file (atomic)
+  drafty canvas status <file>              sync report: in-sync / local-ahead / canvas-ahead / diverged
   drafty canvas rename <slug> "<title>"
   drafty canvas set <slug> [--project P|--no-project] [--tag T…] [--untag T…] [--clear-tags]   organize
   drafty canvas tag <slug> <label…> / untag <slug> <label…>   add/remove kind labels
@@ -1277,6 +1564,7 @@ COMMENTS — threads pinned to a canvas, and their replies
   drafty comments rm-reply <commentId>        delete a single reply
   drafty comments clear <slug> --yes          delete all threads on a canvas
 
+  drafty shot <slug|file.html|url> [--width N] [--revision R] [--annotation A] [--full] [-o out]   render to an image and print its path (the agent's eyes)
   drafty context [--limit N] [--archived] [--json]   one-shot orientation: identity, git, projects, tags + recent canvases
   drafty changelog [--json]                   what shipped, by week
   drafty login / logout                       sign in (browser; web + CLI) / sign out
@@ -1293,7 +1581,7 @@ it into a real account in place. Point at another server with DRAFTY_BASE_URL.
 type Cmd = (args: string[]) => unknown;
 const CANVAS: Record<string, Cmd> = {
   push: canvasPush, ls: canvasLs, show: canvasShow, pull: canvasPull,
-  versions: canvasVersions, restore: canvasRestore, rename: canvasRename,
+  versions: canvasVersions, restore: canvasRestore, revert: canvasRevert, status: canvasStatus, rename: canvasRename,
   set: canvasSet, tag: (a) => canvasTag(a, true), untag: (a) => canvasTag(a, false),
   archive: (a) => canvasArchive(a, true), unarchive: (a) => canvasArchive(a, false),
   pin: (a) => canvasPin(a, true), unpin: (a) => canvasPin(a, false),
@@ -1306,7 +1594,7 @@ const COMMENTS: Record<string, Cmd> = {
 };
 const MARKS: Record<string, Cmd> = { ls: marksLs, rm: marksRm };
 // Top-level: session / meta — not scoped to a canvas or a comment.
-const TOP: Record<string, Cmd> = { context, changelog, login, logout, whoami, setup, doctor };
+const TOP: Record<string, Cmd> = { context, changelog, login, logout, whoami, setup, doctor, shot };
 
 function runGroup(name: string, table: Record<string, Cmd>, args: string[]) {
   const [verb, ...rest] = args;
