@@ -167,13 +167,27 @@ function inferFormat(file: string, content: string): "markdown" | "html" {
   if (/^﻿?\s*<(?:!doctype\s+html|html[\s>])/i.test(content)) return "html";
   return /\.html?$/i.test(file) ? "html" : "markdown";
 }
+// Titles are stored and rendered as plain text, but inferTitle reads HTML *source*
+// (and markdown, where renderers also honor entities) — so "A &amp; B" must become
+// "A & B" here. &amp; is decoded last so "&amp;lt;" doesn't double-decode.
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&");
+}
 function inferTitle(content: string, format: string, file: string): string {
   if (format === "markdown") {
     const m = content.match(/^#\s+(.+)$/m);
-    if (m) return m[1].trim();
+    if (m) return decodeEntities(m[1].trim());
   } else {
     const t = content.match(/<title[^>]*>([^<]+)<\/title>/i) || content.match(/<h1[^>]*>([^<]+)<\/h1>/i);
-    if (t) return t[1].trim();
+    if (t) return decodeEntities(t[1].trim());
   }
   return basename(file).replace(/\.[^.]+$/, "");
 }
