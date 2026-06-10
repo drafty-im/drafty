@@ -588,6 +588,33 @@ async function canvasVersions(args: string[]) {
   }
 }
 
+// Marks — data-plane row state on live canvases ("done"/"saved" on a
+// data-key). Refresh scripts read these back to filter the next render:
+//   DONE=$(drafty marks ls <slug> --kind done --json | jq -r '.items[].dataKey')
+async function marksLs(args: string[]) {
+  const slug = args[0];
+  if (!slug || slug.startsWith("--")) return die("usage: drafty marks ls <slug> [--kind <kind>] [--json]");
+  const kind = flag(args, "kind");
+  const r = await api("marks.ls", { method: "GET", query: { slug, ...(kind ? { kind } : {}) } });
+  if (has(args, "json")) { console.log(JSON.stringify(r, null, 2)); return; }
+  const items = r.items as any[];
+  if (!items.length) { console.log(`no marks on ${slug}${kind ? ` (kind: ${kind})` : ""}`); return; }
+  console.log(`# ${slug} — ${items.length} mark(s)
+`);
+  for (const m of items) {
+    console.log(`${m.dataKey}`);
+    console.log(`  ${m.kind} · ${m.authorName} · ${new Date(m.createdAt).toLocaleString()} · rm: drafty marks rm ${m.id}
+`);
+  }
+}
+
+async function marksRm(args: string[]) {
+  const markId = args[0];
+  if (!markId) return die("usage: drafty marks rm <markId>");
+  await api("marks.rm", { body: { markId } });
+  console.log(`✓ removed mark ${markId}`);
+}
+
 async function canvasMode(args: string[]) {
   const slug = args[0];
   const mode = parseMode(args[1]);
@@ -1218,6 +1245,8 @@ CANVAS — the canvas you publish
   drafty canvas show <slug>                meta: title, link, project, tags, mode, threads
   drafty canvas pull <slug> [--revision id] [-o f]   download the content
   drafty canvas versions <slug> [--json]   list a canvas's versions, newest first
+  drafty marks ls <slug> [--kind k] [--json]  marks on a live canvas (done/saved row state)
+  drafty marks rm <markId>                 remove a mark
   drafty canvas restore <slug> <revisionId>   restore to a past version
   drafty canvas rename <slug> "<title>"
   drafty canvas set <slug> [--project P|--no-project] [--tag T…] [--untag T…] [--clear-tags]   organize
@@ -1267,6 +1296,7 @@ const COMMENTS: Record<string, Cmd> = {
   resolve: (a) => commentsStatus(a, "completed"), reopen: (a) => commentsStatus(a, "open"),
   rm: commentsRm, "rm-reply": commentsRmReply, clear: commentsClear,
 };
+const MARKS: Record<string, Cmd> = { ls: marksLs, rm: marksRm };
 // Top-level: session / meta — not scoped to a canvas or a comment.
 const TOP: Record<string, Cmd> = { context, changelog, login, logout, whoami, setup, doctor };
 
@@ -1287,6 +1317,7 @@ async function main() {
   // so existing muscle memory and older docs keep working.
   if (["canvas", "canvases", "documents", "document", "doc"].includes(head)) return runGroup("canvas", CANVAS, rest);
   if (head === "comments" || head === "comment") return runGroup("comments", COMMENTS, rest);
+  if (head === "marks" || head === "mark") return runGroup("marks", MARKS, rest);
   if (head && TOP[head]) return TOP[head](rest);
   console.log(HELP);
   if (head && !["help", "--help", "-h"].includes(head)) process.exit(1);
