@@ -424,7 +424,7 @@ async function uploadLocalAssets(content: string, file: string): Promise<string>
 // ── commands ────────────────────────────────────────────────────────────────
 async function canvasPush(args: string[]) {
   const file = args[0];
-  if (!file) return die("usage: drafty canvas push <file> [--title T] [--slug S] [--mode M] [--format html|markdown] [--project P] [--tag T …]");
+  if (!file) return die("usage: drafty canvas push <file> [--title T] [--slug S] [--mode M] [--format html|markdown] [--project P] [--tag T …] [--refresh]");
   const content = await Bun.file(file).text();
   if (!content.trim()) return die(`file is empty: ${file}`);
   // --format html|markdown is an explicit override; otherwise sniff content+extension.
@@ -439,12 +439,16 @@ async function canvasPush(args: string[]) {
   // Organize flags, parsed up front so a bad value fails before anything publishes.
   const project = flag(args, "project");
   const tags = multiFlag(args, "tag");
+  // --refresh marks this push as coming from a scheduled job (drafty-cron). The
+  // server stamps the canvas as self-refreshing; arming a new one is the free-plan
+  // gate (free includes 1), and re-pushes to an armed canvas always pass.
+  const refresh = has(args, "refresh");
   // Upload local images → served URLs in the published copy; the file on disk is
   // left as-is (small + editable). Titles are inferred from the original content.
   const published = await uploadLocalAssets(content, file);
   // targetSlug = update intent (exact); newSlug = pre-hashed slug if we create.
   const r = await api("canvas.push", {
-    body: { content: published, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(mode ? { mode } : {}), ...(visibility ? { visibility } : {}) },
+    body: { content: published, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(mode ? { mode } : {}), ...(visibility ? { visibility } : {}), ...(refresh ? { refresh: true } : {}) },
   });
   if (r.created) {
     console.log(`✓ published "${r.title}"  ·  ${modeLabel[r.mode as Mode]}`);
@@ -453,6 +457,9 @@ async function canvasPush(args: string[]) {
     if (mode) console.log(`  ${modeLine(mode, r.slug)}`);
   }
   if (visibility) console.log(`  visibility: ${visibilityLabel[visibility]}`);
+  // Server-sent aside (e.g. the first self-refreshing canvas on the free plan).
+  // Relay it verbatim — it's written for the human, not the log.
+  if (r.notice) console.log(`  ${r.notice}`);
   // ?ref=cli attributes views of a freshly-published link back to the CLI publish
   // (the start of the creator→commenter→creator loop).
   console.log(`  ${url(r.slug)}?ref=cli`);

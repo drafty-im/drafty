@@ -25,6 +25,8 @@ if [ "$new" = "$old" ]; then
   echo "$(date '+%F %T') — no change, skipped push"; exit 0
 fi
 
-bun "$DRAFTY" canvas push "$OUT" --private --slug "$SLUG" >/dev/null 2>&1
+# --refresh marks the canvas as self-refreshing (free plan includes one; a
+# second needs Drafty Pro — the push prints the upgrade link if it's gated).
+bun "$DRAFTY" canvas push "$OUT" --private --refresh --slug "$SLUG" >/dev/null 2>&1
 echo "$new" > .last-hash
 echo "$(date '+%F %T') — data changed, pushed"

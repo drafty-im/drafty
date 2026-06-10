@@ -33,6 +33,7 @@ CRON=~/.drafty/cron.sh   # or run the bundled copy directly
    - pull the data (a `bq query`, a SQL connector, an API call, …),
    - render a self-contained HTML file,
    - **push only if the data changed** — hash the HTML *excluding* any "Generated <timestamp>" line, compare to a `.last-hash` sidecar, and skip the push when unchanged. This is what makes a tight cadence safe (no no-op revisions).
+   - **push with `--refresh`** — marks the canvas as self-refreshing on the server. The free plan includes one; arming a second prints an upgrade link (Drafty Pro runs unlimited). Re-pushes to an already-armed canvas always go through, so a running schedule never breaks.
 2. **launchd has a bare PATH** — the #1 gotcha. Export an explicit PATH in the script pointing at the real tools (`~/.bun/bin`, the gcloud SDK bin, `/opt/homebrew/bin`). Use the **version-stable** drafty source CLI for the push (`bun ~/Projects/drafty/plugins/drafty/cli/canvas.ts canvas push …`), not the version-pinned plugin-cache binary.
 3. **Install the cron**, e.g. every 5 minutes:
    ```sh
