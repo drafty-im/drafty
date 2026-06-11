@@ -141,6 +141,7 @@ the update unprompted, since it changes their environment.
 | `drafty canvas revert <file\|slug> [--to <revisionId>]` | **The undo.** Atomically: restore the canvas (default: one revision back) AND rewrite the local file to match + update the manifest. Never hand-edit a file back to undo — a later push would re-introduce what the canvas reverted. |
 | `drafty canvas status <file>` | Sync report for a pushed file: `in-sync` / `local-ahead` (file edited since last push) / `canvas-ahead` (canvas moved — browser edit, restore, another agent) / `diverged` (both). Check before pushing when in doubt. |
 | `drafty shot <slug>\|<file.html>\|<url> [--width N] [--revision <id>] [--annotation <id>] [--full] [-o out]` | **Render to an image and print its path** — your eyes. A local file/URL renders via headless Chrome on this machine; a public canvas renders via the server (cached per revision×width); a private canvas auto-falls back to rendering pulled content locally. `--annotation <id>` reproduces a commenter's exact view (their width + revision, anchored element highlighted). Read the printed path to *see* it. |
+| `drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b…] [--slug S] [--refresh] [--dry-run]` | **Site board**: map a website (its own robots/sitemap/homepage — no crawling), curate ~8 main screens, shoot each at desktop+phone width with local Chrome, and publish an annotatable board canvas. `--dry-run` previews the screen list; `--urls` overrides curation; `--slug <board> --refresh` re-shoots the same screens as a tick (self-refreshing board). |
 | `drafty context [--limit N] [--archived] [--json]` | **Orientation in one call** — identity, local git repo/branch, the projects + tags already in use (with counts), and the most-recent canvases (capped to ~15; `--limit 0` for all). Run it before a push/update to pick the project, reuse tags, and decide create-vs-update. |
 | `drafty canvas ls [--project P] [--tag T] [--unfiled] [--archived] [--json]` | The filtered / full list — **newest first**, the same order as the web home and `drafty context`, each row showing project · `#tags` · open-thread count. Orient with `drafty context` first; reach for `ls` to **drill in or filter**: `--project "<name>"`, `--tag <label>`, `--unfiled` (missing a project or tags), `--archived`. |
 | `drafty changelog [--json]` | What shipped on Drafty, grouped by week (public feed; no sign-in needed). Use when the human asks "what's new in drafty". |
@@ -364,6 +365,34 @@ both ends.
 on any local HTML file with no server and no auth — render what you just wrote,
 look at it, then publish. For visual artifacts this should be routine, not
 exceptional.
+
+**Site boards — present any website for annotation**
+`drafty present <url>` turns a live site into an annotatable canvas: the main
+screens (curated from the site's own sitemap/homepage, capped at 8), each
+captured at desktop and phone width, labeled and timestamped. Use it when the
+human says "present <site>", "make a site board", "let's look at <competitor>",
+"board our staging deploy", or wants to give feedback on something that isn't a
+canvas yet.
+
+- **Preview before shooting** when the site is unfamiliar: `--dry-run` prints
+  the curated screen list; adjust with `--screens N` or hand-pick via
+  `--urls a,b,c`, then run for real.
+- **Review the board before handing it over** — you have eyes; use them.
+  `drafty shot <board-slug> --width 1280` (or open the canvas) and check the
+  frames: a site that refuses iframing renders its phone-width frames blank
+  (the hatched area). If so, re-run with `--widths 1280` and say so.
+- **The feedback loop on a board** is the point-anchor flow: humans tap a spot
+  on a screenshot; your inbox carries the image, the point, and (in the board's
+  meta line) the live URL — so you can also re-render the *current* page
+  (`drafty shot <url>`) to compare against the board's dated snapshot.
+- **Keep it fresh:** `drafty present --slug <board> --refresh` re-shoots the
+  SAME screens (read back from the board's embedded meta — no re-discovery
+  drift) and updates in place as a tick. On a schedule, that's a self-refreshing
+  site board: competitor tracking, staging watch. Arm it like any refreshing
+  canvas (the first `--refresh` push registers it).
+- A board is a **dated snapshot** — every screen carries its capture time.
+  Don't present it as the live site; the quiet URL under each screen is there
+  for checking current state.
 
 **Autonomous mode — wake on events, handle in an active session**
 The handler is an **active Claude Code session** — no `claude -p`, no API calls.

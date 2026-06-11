@@ -776,9 +776,13 @@ async function localShot(target: string, opts: { width: number; height: number; 
       ...(narrow ? ["--allow-file-access-from-files"] : []),
       `--user-data-dir=${profile}`,
       `--window-size=${Math.max(opts.width, CHROME_MIN_W)},${opts.height}`,
+      // Pages that hold live sockets (or iframes that do) may never fire a
+      // clean load — --timeout makes Chrome stop and shoot what's rendered;
+      // the spawn timeout below is the hard backstop.
+      "--timeout=25000",
       `--screenshot=${opts.out}`, src,
     ],
-    { stdout: "pipe", stderr: "pipe" },
+    { stdout: "pipe", stderr: "pipe", timeout: 60_000 },
   );
   for (const t of tmps) rmSync(t, { force: true });
   rmSync(profile, { recursive: true, force: true });
@@ -857,6 +861,351 @@ async function shot(args: string[]) {
   console.error(`  ${r.cached ? "cache hit" : "rendered"} · ${r.width}px${r.revisionId ? ` · revision ${r.revisionId}` : ""} · ${r.url}`);
   console.log(out);
   await track("canvas.shot", { slug, width: r.width, cached: !!r.cached, annotation: !!annotationId });
+}
+
+// ── drafty present (site boards) ─────────────────────────────────────────────
+// `drafty present <url>` → a canvas of the site's main screens, annotatable.
+// Pipeline: map → curate → shoot → compose → push. No crawling, no Firecrawl:
+// discovery reads what sites already publish (robots.txt → sitemap.xml →
+// homepage links), curation is heuristic (URL-template collapse, nav order,
+// cap), shots are local headless Chrome, and the board pushes through the
+// normal asset pipeline. Deterministic for a given site state — which is what
+// makes the refresh recipe a one-liner (`--slug <board> --refresh` re-shoots
+// the same screens as a tick).
+
+const PRESENT_UA = "Mozilla/5.0 (compatible; drafty-present; +https://drafty.im)";
+// Paths that are never "main screens": auth/account/commerce plumbing and API-ish.
+const PRESENT_SKIP_PATH = /(^|\/)(login|log-in|signin|sign-in|signup|sign-up|register|logout|account|admin|cart|checkout|api|cdn-cgi|wp-admin|wp-json)(\/|$)/i;
+// Asset/document extensions — not pages.
+const PRESENT_SKIP_EXT = /\.(png|jpe?g|gif|svg|webp|avif|ico|pdf|zip|gz|xml|rss|atom|json|css|js|mjs|map|txt|mp4|webm|mp3|woff2?)$/i;
+const PRESENT_SKIP_PAGINATION = /\/page\/\d+(\/|$)/i;
+
+async function presentFetch(url: string, timeoutMs = 15000): Promise<string | null> {
+  try {
+    const res = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { "user-agent": PRESENT_UA, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+// Normalize to origin + pathname (query/fragment dropped — they're almost never
+// distinct "screens", and dropping them collapses utm/tracking variants).
+function presentNorm(u: URL): string {
+  let path = u.pathname;
+  if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+  return u.origin + path;
+}
+
+function presentKeep(u: URL, root: URL): boolean {
+  if (u.origin !== root.origin) return false;
+  if (PRESENT_SKIP_EXT.test(u.pathname)) return false;
+  if (PRESENT_SKIP_PATH.test(u.pathname)) return false;
+  if (PRESENT_SKIP_PAGINATION.test(u.pathname)) return false;
+  return true;
+}
+
+// Discovery: robots.txt sitemaps (following one level of sitemap index), else
+// /sitemap.xml, plus the homepage's own links — which double as the nav-order
+// ranking signal (what the site promotes from its front door).
+async function presentDiscover(root: URL): Promise<{ all: string[]; navOrder: string[] }> {
+  const all = new Set<string>([presentNorm(root)]);
+  const robots = await presentFetch(new URL("/robots.txt", root).href, 8000);
+  let sitemaps = robots ? [...robots.matchAll(/^sitemap:\s*(\S+)/gim)].map((m) => m[1]) : [];
+  if (!sitemaps.length) sitemaps = [new URL("/sitemap.xml", root).href];
+  const queue = sitemaps.slice(0, 5);
+  let fetched = 0;
+  let pageUrls: string[] = [];
+  while (queue.length && fetched < 8 && pageUrls.length < 2000) {
+    const sm = queue.shift()!;
+    fetched++;
+    const xml = await presentFetch(sm);
+    if (!xml) continue;
+    const locs = [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map((m) => m[1]);
+    if (/<sitemapindex/i.test(xml)) queue.push(...locs.slice(0, 6));
+    else pageUrls = pageUrls.concat(locs);
+  }
+  for (const raw of pageUrls) {
+    try {
+      const u = new URL(raw);
+      if (presentKeep(u, root)) all.add(presentNorm(u));
+    } catch { /* malformed loc */ }
+  }
+  const navOrder: string[] = [];
+  const home = await presentFetch(root.href);
+  if (home) {
+    for (const m of home.matchAll(/<a\b[^>]*?href\s*=\s*["']([^"'#]+?)["']/gi)) {
+      try {
+        const u = new URL(m[1], root);
+        if (!presentKeep(u, root)) continue;
+        const n = presentNorm(u);
+        if (!navOrder.includes(n)) navOrder.push(n);
+        all.add(n);
+      } catch { /* relative junk */ }
+    }
+  }
+  return { all: [...all], navOrder };
+}
+
+// Curation: pick the "main screens" without a model. Root first, then what the
+// homepage links to (the site's own sense of what matters), then one exemplar
+// per URL template — /recipes/[slug] is one screen, not three hundred. Depth-1
+// pages never collapse (they ARE the nav); deeper siblings sharing a parent
+// path collapse once the group has 3+ members.
+function presentCurate(root: URL, all: string[], navOrder: string[], cap: number): string[] {
+  const rootNorm = presentNorm(root);
+  const depth = (s: string) => new URL(s).pathname.split("/").filter(Boolean).length;
+  const parentKey = (s: string) => {
+    const segs = new URL(s).pathname.split("/").filter(Boolean);
+    return segs.length >= 2 ? segs.slice(0, -1).join("/") : null;
+  };
+  const groups = new Map<string, string[]>();
+  for (const s of all) {
+    const k = parentKey(s);
+    if (k != null) groups.set(k, [...(groups.get(k) ?? []), s]);
+  }
+  const isTemplateMember = (s: string) => {
+    const k = parentKey(s);
+    return k != null && (groups.get(k)?.length ?? 0) >= 3;
+  };
+  const navRank = (s: string) => {
+    const i = navOrder.indexOf(s);
+    return i < 0 ? Infinity : i;
+  };
+  const chosen: string[] = [rootNorm];
+  const seenGroups = new Set<string>();
+  const take = (s: string) => {
+    if (chosen.length >= cap || chosen.includes(s)) return;
+    const k = parentKey(s);
+    if (k != null && isTemplateMember(s)) {
+      if (seenGroups.has(k)) return; // one exemplar per template
+      seenGroups.add(k);
+    }
+    chosen.push(s);
+  };
+  // 1) homepage order — non-template pages first (real nav destinations)…
+  for (const s of navOrder) if (!isTemplateMember(s)) take(s);
+  // 2) …then template exemplars the homepage itself promotes (featured item).
+  for (const s of navOrder) take(s);
+  // 3) remaining non-template pages, shallow + short first.
+  const rest = all.filter((s) => !chosen.includes(s)).sort((a, b) => depth(a) - depth(b) || a.length - b.length);
+  for (const s of rest) if (!isTemplateMember(s)) take(s);
+  // 4) remaining template exemplars (sections the homepage didn't link).
+  for (const s of rest) take(s);
+  return chosen.slice(0, cap);
+}
+
+function presentPrettyPath(s: string): string {
+  const path = new URL(s).pathname;
+  if (path === "/" || path === "") return "Home";
+  const last = path.split("/").filter(Boolean).pop()!;
+  return last.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+async function presentLabels(urls: string[]): Promise<string[]> {
+  return Promise.all(
+    urls.map(async (s) => {
+      const html = await presentFetch(s, 8000);
+      const m = html?.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      if (!m) return presentPrettyPath(s);
+      let t = m[1]
+        .replace(/&amp;/g, "&").replace(/&#0?39;/g, "'").replace(/&#x27;/gi, "'")
+        .replace(/&quot;/g, '"').replace(/&#x2f;/gi, "/").replace(/&gt;/g, ">").replace(/&lt;/g, "<")
+        .replace(/\s+/g, " ").trim();
+      // Drop the "| Site Name" / "— Site Name" boilerplate tail.
+      t = t.split(/\s+[|·—–-]\s+/)[0].trim() || t;
+      return t.length > 64 ? t.slice(0, 63) + "…" : t || presentPrettyPath(s);
+    }),
+  );
+}
+
+type PresentScreen = { url: string; label: string };
+
+// The board: self-contained HTML, point-anchor friendly (one plain <img> per
+// shot), timestamp prominent, live URL quiet. The JSON meta block is what makes
+// refresh deterministic — a re-run with --slug reads it back instead of
+// re-discovering.
+function presentBoardHtml(root: URL, screens: PresentScreen[], widths: number[], stamp: string, shotFile: (i: number, w: number) => string): string {
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  const meta = JSON.stringify({ kind: "drafty-present", root: root.href, widths, screens }, null, 1);
+  const sections = screens
+    .map((sc, i) => {
+      const path = new URL(sc.url).pathname || "/";
+      const figs = widths
+        .map((w) => {
+          // Sub-500px shots come back 500px wide (Chrome's window floor) with a
+          // hatched dead zone right of the real viewport — crop it off with CSS
+          // so the board shows exactly the w-px artifact.
+          const img = `<img src="${shotFile(i, w)}" alt="${esc(sc.label)} — ${w}px" />`;
+          const body = w < 500 ? `<div class="crop" style="--vw:${w}">${img}</div>` : img;
+          return `<figure>${body}<figcaption>${w}px</figcaption></figure>`;
+        })
+        .join("\n      ");
+      return `  <section class="screen">
+    <h2>${esc(sc.label)}</h2>
+    <p class="meta"><a href="${esc(sc.url)}" rel="noopener">${esc(path)}</a> · captured ${stamp}</p>
+    <div class="pair">
+      ${figs}
+    </div>
+  </section>`;
+    })
+    .join("\n");
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
+<title>${esc(root.host)} — site board</title>
+<style>
+  :root { --ink:#16181d; --muted:#5b6470; --line:#e3e6ea; --bg:#f6f7f9; --card:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#e8eaee; --muted:#9aa3ad; --line:#2a2e35; --bg:#0b0c0f; --card:#15171c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:36px 18px; background:var(--bg); color:var(--ink);
+         font-family: ui-sans-serif, -apple-system, system-ui, sans-serif; line-height:1.5; }
+  main { max-width: 1060px; margin: 0 auto; }
+  h1 { font-size: 26px; letter-spacing: -0.02em; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 26px; }
+  .sub a { color: inherit; }
+  .screen { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+            padding: 18px 20px; margin: 0 0 18px; }
+  h2 { font-size: 17px; margin: 0 0 2px; }
+  .meta { font-size: 12px; color: var(--muted); margin: 0 0 12px; font-family: ui-monospace, monospace; }
+  .meta a { color: inherit; }
+  .pair { display: grid; grid-template-columns: ${widths.length > 1 ? "2fr 1fr" : "1fr"}; gap: 14px; align-items: start; }
+  @media (max-width: 720px) { .pair { grid-template-columns: 1fr; } }
+  figure { margin: 0; }
+  figure img { display: block; width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  .crop { overflow: hidden; border: 1px solid var(--line); border-radius: 8px; }
+  .crop img { width: calc(100% * 500 / var(--vw)); border: 0; border-radius: 0; }
+  figcaption { font-size: 11px; color: var(--muted); margin-top: 5px; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<main>
+  <h1>${esc(root.host)} — site board</h1>
+  <p class="sub">captured ${stamp} · ${screens.length} screen${screens.length === 1 ? "" : "s"} · <a href="${esc(root.href)}" rel="noopener">${esc(root.host)}</a></p>
+${sections}
+</main>
+<script type="application/json" id="drafty-present-meta">${meta}</script>
+</body>
+</html>
+`;
+}
+
+async function present(args: string[]) {
+  const usage =
+    "usage: drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b,c] [--slug S] [--title T] [--refresh] [--project P] [--tag T …] [--dry-run]";
+  const slugFlag = flag(args, "slug");
+  const refresh = has(args, "refresh");
+  const dry = has(args, "dry-run");
+  const cap = Math.max(1, Math.min(20, Number(flag(args, "screens") ?? 8)));
+  let widths = (flag(args, "widths") ?? "1280,390").split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
+  if (!widths.length) widths = [1280, 390];
+
+  let rootStr = args[0] && !args[0].startsWith("--") ? args[0] : undefined;
+  let screens: PresentScreen[] | null = null;
+
+  // Refresh / re-run against an existing board: read the screen list back from
+  // the board's own meta block, so the run is byte-deterministic with the
+  // original (same URLs, same widths) — no re-discovery drift.
+  if (slugFlag) {
+    try {
+      const pulled = await api("canvas.pull", { method: "GET", query: { slug: slugFlag } });
+      const m = String(pulled.content).match(/<script type="application\/json" id="drafty-present-meta">([\s\S]*?)<\/script>/);
+      if (m) {
+        const meta = JSON.parse(m[1]);
+        if (meta?.kind === "drafty-present" && Array.isArray(meta.screens)) {
+          screens = meta.screens;
+          rootStr = rootStr ?? meta.root;
+          if (!flag(args, "widths") && Array.isArray(meta.widths) && meta.widths.length) widths = meta.widths;
+          console.error(`  ↻ re-shooting ${screens!.length} screens from the board's meta`);
+        }
+      }
+    } catch { /* board doesn't exist yet — treat as a fresh run targeting that slug */ }
+  }
+  if (!rootStr) return die(usage);
+  const root = new URL(/^https?:\/\//i.test(rootStr) ? rootStr : "https://" + rootStr);
+
+  if (!screens) {
+    const urlsFlag = multiFlag(args, "urls");
+    let chosen: string[];
+    if (urlsFlag.length) {
+      chosen = urlsFlag.map((u) => presentNorm(new URL(/^https?:\/\//i.test(u) ? u : "https://" + u))).slice(0, cap);
+    } else {
+      console.error(`  ⌕ mapping ${root.host} (robots → sitemap → homepage links)…`);
+      const { all, navOrder } = await presentDiscover(root);
+      if (!all.length) return die(`found no pages at ${root.href}`);
+      chosen = presentCurate(root, all, navOrder, cap);
+      console.error(`  ⌕ ${all.length} pages found → ${chosen.length} screens curated`);
+    }
+    const labels = await presentLabels(chosen);
+    // SPAs often serve one generic <title> for every route — disambiguate
+    // duplicates with the path so screens stay tellable-apart.
+    const counts = new Map<string, number>();
+    for (const l of labels) counts.set(l, (counts.get(l) ?? 0) + 1);
+    screens = chosen.map((url, i) => ({
+      url,
+      label: (counts.get(labels[i]) ?? 0) > 1 ? `${labels[i]} · ${presentPrettyPath(url)}` : labels[i],
+    }));
+  }
+
+  if (dry) {
+    console.log(`# ${root.host} — ${screens.length} screen(s), widths ${widths.join("/")}`);
+    screens.forEach((s, i) => console.log(`${String(i + 1).padStart(2)}. ${s.label}\n    ${s.url}`));
+    return;
+  }
+
+  // Shoot every screen at every width (local Chrome — zero credits).
+  const work = join(tmpdir(), `drafty-present-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
+  mkdirSync(join(work, "screens"), { recursive: true });
+  const shotFile = (i: number, w: number) => `screens/${i}-${w}.png`;
+  for (let i = 0; i < screens.length; i++) {
+    for (const w of widths) {
+      console.error(`  ◉ ${screens[i].label} @ ${w}px`);
+      await localShot(screens[i].url, { width: w, height: w < 500 ? 844 : 900, out: join(work, shotFile(i, w)) });
+    }
+  }
+
+  const stamp = new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  const html = presentBoardHtml(root, screens, widths, stamp, shotFile);
+  const boardFile = join(work, "board.html");
+  writeFileSync(boardFile, html);
+
+  console.error(`  ⬆ publishing board (${screens.length * widths.length} images)…`);
+  const published = await uploadLocalAssets(html, boardFile);
+  const title = flag(args, "title") ?? `${root.host} — site board`;
+  const r = await api("canvas.push", {
+    body: {
+      content: published,
+      format: "html",
+      title,
+      targetSlug: slugFlag,
+      newSlug: slugify(slugFlag || title),
+      ...(refresh ? { refresh: true } : {}),
+    },
+  });
+  // File it: explicit flags win; otherwise every board gets the site-board tag.
+  const project = flag(args, "project");
+  const tags = multiFlag(args, "tag");
+  try {
+    await api("canvas.set", { body: { slug: r.slug, ...(project !== undefined ? { project } : {}), addTags: tags.length ? tags : ["site-board"] } });
+  } catch { /* organizing is best-effort */ }
+  rmSync(work, { recursive: true, force: true });
+
+  console.log(`✓ ${r.created ? "published" : r.tick ? "refreshed" : "updated"} "${r.title}" — ${screens.length} screens × ${widths.join("/")}px`);
+  if (r.notice) console.log(`  ${r.notice}`);
+  console.log(`  ${url(r.slug)}?ref=cli`);
+  if (r.created && !refresh)
+    console.log(`  keep it fresh: drafty present --slug ${r.slug} --refresh   (re-shoots the same screens)`);
+  await track("canvas.presented", { slug: r.slug, screens: screens.length, widths: widths.length, refresh, created: !!r.created });
 }
 
 // Download the artifact body. Content goes to stdout (newline-terminated) so it
@@ -1597,6 +1946,7 @@ COMMENTS — threads pinned to a canvas, and their replies
   drafty comments clear <slug> --yes          delete all threads on a canvas
 
   drafty shot <slug|file.html|url> [--width N] [--revision R] [--annotation A] [--full] [-o out]   render to an image and print its path (the agent's eyes)
+  drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b…] [--slug S] [--refresh] [--dry-run]   site board: map → curate → shoot → annotatable canvas
   drafty context [--limit N] [--archived] [--json]   one-shot orientation: identity, git, projects, tags + recent canvases
   drafty changelog [--json]                   what shipped, by week
   drafty login / logout                       sign in (browser; web + CLI) / sign out
@@ -1626,7 +1976,7 @@ const COMMENTS: Record<string, Cmd> = {
 };
 const MARKS: Record<string, Cmd> = { ls: marksLs, rm: marksRm };
 // Top-level: session / meta — not scoped to a canvas or a comment.
-const TOP: Record<string, Cmd> = { context, changelog, login, logout, whoami, setup, doctor, shot };
+const TOP: Record<string, Cmd> = { context, changelog, login, logout, whoami, setup, doctor, shot, present };
 
 function runGroup(name: string, table: Record<string, Cmd>, args: string[]) {
   const [verb, ...rest] = args;
