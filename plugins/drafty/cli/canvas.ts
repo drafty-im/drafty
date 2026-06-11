@@ -765,11 +765,13 @@ async function localShot(target: string, opts: { width: number; height: number; 
     src = "file://" + h;
     console.error(`  note: artifact is the left ${opts.width}px of the image (hatched area is outside the viewport)`);
   }
-  // A throwaway profile dir: without it the spawn can block on the running
-  // Chrome's profile lock (it tries to join the existing instance) instead of
-  // rendering headlessly.
-  const profile = join(tmpdir(), `drafty-shot-profile-${process.pid}`);
-  const proc = Bun.spawnSync(
+  // A throwaway profile dir, unique PER CALL: without it the spawn can block on
+  // the running Chrome's profile lock, and concurrent shots (present runs a
+  // small pool) would otherwise collide on a shared dir.
+  const profile = join(tmpdir(), `drafty-shot-profile-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
+  // Async spawn so a pool of shots can actually run concurrently (spawnSync
+  // blocks the event loop and serializes everything).
+  const proc = Bun.spawn(
     [
       chrome, "--headless=new", "--hide-scrollbars", "--no-first-run", "--disable-extensions",
       // lets the file:// harness iframe load its file:// target
@@ -779,14 +781,16 @@ async function localShot(target: string, opts: { width: number; height: number; 
       // Pages that hold live sockets (or iframes that do) may never fire a
       // clean load — --timeout makes Chrome stop and shoot what's rendered;
       // the spawn timeout below is the hard backstop.
-      "--timeout=25000",
+      "--timeout=12000",
       `--screenshot=${opts.out}`, src,
     ],
-    { stdout: "pipe", stderr: "pipe", timeout: 60_000 },
+    { stdout: "pipe", stderr: "pipe", timeout: 45_000 },
   );
+  const stderrText = await new Response(proc.stderr).text();
+  await proc.exited;
   for (const t of tmps) rmSync(t, { force: true });
   rmSync(profile, { recursive: true, force: true });
-  if (!existsSync(opts.out)) die(`chrome render failed: ${new TextDecoder().decode(proc.stderr).slice(-400)}`);
+  if (!existsSync(opts.out)) die(`chrome render failed: ${stderrText.slice(-400)}`);
 }
 
 async function shot(args: string[]) {
@@ -1167,12 +1171,19 @@ async function present(args: string[]) {
   const work = join(tmpdir(), `drafty-present-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
   mkdirSync(join(work, "screens"), { recursive: true });
   const shotFile = (i: number, w: number) => `screens/${i}-${w}.png`;
-  for (let i = 0; i < screens.length; i++) {
-    for (const w of widths) {
-      console.error(`  ◉ ${screens[i].label} @ ${w}px`);
-      await localShot(screens[i].url, { width: w, height: w < 500 ? 844 : 900, out: join(work, shotFile(i, w)) });
+  // Pool of 4 concurrent Chromes: SPA-ish pages run out the full settle
+  // timeout, so serial shots made an 8-screen board take many minutes.
+  const jobs: Array<{ i: number; w: number }> = [];
+  for (let i = 0; i < screens.length; i++) for (const w of widths) jobs.push({ i, w });
+  let next = 0;
+  const worker = async () => {
+    while (next < jobs.length) {
+      const { i, w } = jobs[next++];
+      console.error(`  ◉ ${screens![i].label} @ ${w}px`);
+      await localShot(screens![i].url, { width: w, height: w < 500 ? 844 : 900, out: join(work, shotFile(i, w)) });
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, jobs.length) }, worker));
 
   const stamp = new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC";
   const html = presentBoardHtml(root, screens, widths, stamp, shotFile);
