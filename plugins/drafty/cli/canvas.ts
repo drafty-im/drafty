@@ -1183,7 +1183,7 @@ ${sections}
 
 async function present(args: string[]) {
   const usage =
-    "usage: drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b,c] [--slug S] [--title T] [--refresh] [--project P] [--tag T …] [--dry-run]";
+    "usage: drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b,c] [--slug S] [--title T] [--visibility public|authed|invite] [--refresh] [--project P] [--tag T …] [--dry-run]";
   const slugFlag = flag(args, "slug");
   const refresh = has(args, "refresh");
   const dry = has(args, "dry-run");
@@ -1272,6 +1272,7 @@ async function present(args: string[]) {
   console.error(`  ⬆ publishing board (${screens.length * widths.length} images)…`);
   const published = await uploadLocalAssets(html, boardFile);
   const title = flag(args, "title") ?? `${root.host} — site board`;
+  const visibility = parseVisibility(args);
   const r = await api("canvas.push", {
     body: {
       content: published,
@@ -1279,6 +1280,7 @@ async function present(args: string[]) {
       title,
       targetSlug: slugFlag,
       newSlug: slugify(slugFlag || title),
+      ...(visibility ? { visibility } : {}),
       ...(refresh ? { refresh: true } : {}),
     },
   });
@@ -1293,6 +1295,11 @@ async function present(args: string[]) {
   console.log(`✓ ${r.created ? "published" : r.tick ? "refreshed" : "updated"} "${r.title}" — ${screens.length} screens × ${widths.join("/")}px`);
   if (r.notice) console.log(`  ${r.notice}`);
   console.log(`  ${url(r.slug)}?ref=cli`);
+  // Boards exist to be shared (clients, teammates) — surface the gate that the
+  // private-by-default server applies, so "they can't open my board" is never
+  // a surprise. --visibility public skips it at creation.
+  if (r.created && !visibility)
+    console.log(`  visibility: private to you — run \`drafty canvas visibility ${r.slug} public\` to share it`);
   if (r.created && !refresh)
     console.log(`  keep it fresh: drafty present --slug ${r.slug} --refresh   (re-shoots the same screens)`);
   await track("canvas.presented", { slug: r.slug, screens: screens.length, widths: widths.length, refresh, created: !!r.created });
