@@ -1497,6 +1497,78 @@ async function canvasArchive(args: string[], archived: boolean) {
   else console.log(`✓ unarchived ${slug} — back in \`drafty canvas ls\``);
 }
 
+// Ship close-out — the whole "this canvas's work landed" sequence as one
+// command: stamp a Shipped receipt onto the body (markdown or HTML to match the
+// canvas), reply + resolve every open thread with the landing commits, then
+// archive. Safe to re-run on a half-finished ship: a receipt that already names
+// every given commit isn't stamped twice, and resolved threads are skipped.
+async function canvasShip(args: string[]) {
+  const slug = args[0];
+  const commits = multiFlag(args, "commit");
+  if (!slug || slug.startsWith("--") || !commits.length)
+    return die('usage: drafty canvas ship <slug> --commit <sha>[,<sha>…] [--note "<one line>"] [--repo <name>]');
+
+  // Normalize against the cwd repo when possible: short shas in the receipt,
+  // the repo name in parentheses, and the first commit's subject as the default
+  // note. Outside a repo (or for refs it can't resolve) values pass through.
+  const git = gitContext();
+  const gitOut = (cmd: string[]): string | null => {
+    if (!git.root) return null;
+    try {
+      const p = spawnSync("git", cmd, { cwd: git.root, stdio: ["ignore", "pipe", "ignore"] });
+      return p.status === 0 ? p.stdout.toString().trim() || null : null;
+    } catch { return null; }
+  };
+  const shas = commits.map((ref) => gitOut(["rev-parse", "--short=7", `${ref}^{commit}`]) ?? ref);
+  const repo = flag(args, "repo") ?? git.repo ?? undefined;
+  const note = flag(args, "note") ?? gitOut(["log", "-1", "--format=%s", shas[0]]) ?? undefined;
+
+  const r = await api("canvas.pull", { method: "GET", query: { slug } });
+  console.error(`# ${r.title} — ${url(slug)}`);
+
+  // Receipt. Skipped when the body already carries a Shipped block naming every
+  // given commit — re-running a ship must not stack duplicate footers.
+  // Local date, not toISOString(): UTC rolls the day back for anyone east of it.
+  const d = new Date();
+  const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const stamped = r.content.includes("Shipped") && shas.every((s) => r.content.includes(s));
+  if (stamped) {
+    console.log(`  receipt already present — not stamping again`);
+  } else {
+    const tail = `${repo ? ` (${repo})` : ""}${note ? ` — ${note}` : ""}`;
+    let content: string;
+    if (r.format === "html") {
+      const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const receipt =
+        `<section style="margin-top:48px;padding-top:14px;border-top:1px solid rgba(127,127,127,.35);` +
+        `font:13px/1.6 system-ui,sans-serif;color:#888">✅ Shipped — ${today} · Landed in ` +
+        `${shas.map((s) => `<code>${esc(s)}</code>`).join(", ")}${esc(tail)}.</section>`;
+      const at = r.content.toLowerCase().lastIndexOf("</body>");
+      content = at >= 0 ? `${r.content.slice(0, at)}${receipt}\n${r.content.slice(at)}` : `${r.content}\n${receipt}\n`;
+    } else {
+      const receipt = `\n---\n\n## ✅ Shipped — ${today}\n\nLanded in ${shas.map((s) => `\`${s}\``).join(", ")}${tail}.\n`;
+      content = `${r.content.replace(/\n*$/, "\n")}${receipt}`;
+    }
+    await api("canvas.push", { body: { content, format: r.format, title: r.title, targetSlug: slug, newSlug: slug } });
+    console.log(`✓ receipt stamped — Shipped ${today}, ${shas.join(", ")}${repo ? ` (${repo})` : ""}`);
+  }
+
+  // Close the loop for commenters: every still-open thread gets the landing
+  // commit as a reply, then a resolve — closure, not silence.
+  const open = ((await api("comments.ls", { method: "GET", query: { slug } })).annotations as any[]).filter((a) => a.status !== "completed");
+  const replyBody = `Shipped in ${shas.join(", ")}${note ? ` — ${note}` : ""}`;
+  for (const a of open) {
+    await api("comments.reply", { body: { annotationId: a.id, body: replyBody } });
+    await api("comments.resolve", { body: { annotationId: a.id } });
+  }
+  console.log(open.length ? `✓ closed ${open.length} open thread(s) — replied "${replyBody}" + resolved` : `  no open threads`);
+
+  await api("canvas.set", { body: { slug, archived: true } });
+  console.log(`✓ archived ${slug} — off your list; link + history kept`);
+  console.log(`  ${url(slug)}`);
+  await track("canvas.shipped", { slug, commits: shas.length, threads_closed: open.length, receipt: stamped ? "existing" : "stamped" });
+}
+
 // Pin/unpin: a stick flag. Pinned canvases hold the "Pinned" lane on drafty.im/home
 // (between Live and Recent) so a long-lived canvas never sinks into Recent as newer
 // ones publish. Orthogonal to status/archive — it only affects list position.
@@ -2359,6 +2431,7 @@ CANVAS — the canvas you publish
   drafty canvas set <slug> [--project P|--no-project] [--tag T…] [--untag T…] [--clear-tags]   organize
   drafty canvas tag <slug> <label…> / untag <slug> <label…>   add/remove kind labels
   drafty canvas archive <slug> / unarchive <slug>   hide from / restore to \`canvas ls\`
+  drafty canvas ship <slug> --commit <sha>[,…] [--note "…"]   close out shipped work: stamp receipt, resolve threads, archive
   drafty canvas pin <slug> / unpin <slug>   hold in / release from the Pinned lane on your home
   drafty canvas mode <slug> <readonly|feedback|live>   how it behaves when shared
   drafty canvas visibility <slug> <public|authed|invite|private>   who can view it (invite/private = owner + invited only)
@@ -2402,7 +2475,7 @@ const CANVAS: Record<string, Cmd> = {
   push: canvasPush, ls: canvasLs, show: canvasShow, pull: canvasPull,
   versions: canvasVersions, restore: canvasRestore, revert: canvasRevert, status: canvasStatus, rename: canvasRename,
   set: canvasSet, tag: (a) => canvasTag(a, true), untag: (a) => canvasTag(a, false),
-  archive: (a) => canvasArchive(a, true), unarchive: (a) => canvasArchive(a, false),
+  archive: (a) => canvasArchive(a, true), unarchive: (a) => canvasArchive(a, false), ship: canvasShip,
   pin: (a) => canvasPin(a, true), unpin: (a) => canvasPin(a, false),
   mode: canvasMode, visibility: canvasVisibility, rm: canvasRm, claim: canvasClaim,
 };

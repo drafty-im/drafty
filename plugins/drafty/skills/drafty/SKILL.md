@@ -158,6 +158,7 @@ the update unprompted, since it changes their environment.
 | `drafty canvas tag <slug> <label…>` / `drafty canvas untag <slug> <label…>` | Add/remove cross-cutting labels for *what the canvas is* — `plan`, `research`, `testing-report`, … A canvas can carry several; they're normalised (lowercased, `#` stripped, spaces → `-`). `untag --all` clears them. Project is set via `drafty canvas set` (below). |
 | `drafty canvas set <slug> [--project P] [--tag T…] [--untag T…]` | Set project/tags on an existing canvas in **one call**, without re-publishing. The efficient primitive for filing a canvas (or a whole tidy-up pass). `--no-project` clears the project. |
 | `drafty canvas archive <slug>` / `drafty canvas unarchive <slug>` | Archive = hide from `drafty canvas ls` and **park it for the loop** (Claude won't auto-work its comments). Use it as the "done/shipped" signal once a canvas's work has landed — its link still opens + takes comments, and its history is kept. Reverse with `unarchive`. |
+| `drafty canvas ship <slug> --commit <sha>[,…] [--note "…"] [--repo R]` | **The ship close-out in one command** — stamps a ✅ Shipped receipt onto the body (matched to the canvas's format), replies + resolves every open thread with the landing commits, then archives. Run it **from the shipping repo**: short shas, the repo name, and a default note (the first commit's subject) come from git. Safe to re-run — an existing receipt isn't stamped twice. |
 | `drafty comments rm-reply <commentId>` | Delete one comment. |
 | `drafty comments rm <annotationId>` | Delete a thread (annotation + its comments). |
 | `drafty comments clear <slug> --yes` | Delete **all** threads on a canvas (keeps the canvas). |
@@ -228,9 +229,9 @@ anything you've shelved so a stray comment doesn't pull Claude back onto it.
 
 **Archive on ship — don't wait to be asked.** A canvas is usually a plan/design/spec that Claude
 then builds. When that work actually ships — the PR is merged, the change is deployed — close the
-canvas out properly (the **ship-moment micro-sweep**, see **The tidy pass** below): stamp a Shipped
-receipt, reply + resolve its open threads with the landing commit, then
-`drafty canvas archive <slug>`. That's the "done" signal: it clears the canvas off the home list
+canvas out from the shipping repo:
+`drafty canvas ship <slug> --commit <sha>` (one command: Shipped receipt stamped onto the body,
+open threads replied + resolved, canvas archived). That's the "done" signal: it clears the canvas off the home list
 while keeping its link and history. Do it on your own at the ship moment (right after you
 merge/deploy), the way you'd close a tracking issue — no need to confirm first; the merge you just
 made *is* the evidence. Don't archive just because comments are resolved — a cleared inbox isn't
@@ -314,31 +315,21 @@ on the list, and not silently hidden either.
    implemented? Classify: **shipped** / **partial** / **leave alone**.
 3. **Propose before acting** — show the human the verdict list (a wrong archive silently parks
    the comment loop). Skip the confirmation only at a ship moment (trigger 2).
-4. For each **shipped** canvas:
-   - **Stamp a receipt** — pull the body, append the Shipped block (below), push it back with
-     `--slug <slug>`. The archived canvas becomes its own record: spec on top, receipt at the bottom.
-   - **Close the loop for commenters** — for each still-open thread:
-     `drafty comments reply <annId> "Shipped in <sha> — <one line>"` then
-     `drafty comments resolve <annId>`. People who left feedback get closure, not silence.
-   - `drafty canvas archive <slug>`.
+4. For each **shipped** canvas, run (from the shipping repo)
+   `drafty canvas ship <slug> --commit <sha>[,…] [--note "…"]` — it stamps the Shipped receipt
+   (the archived canvas becomes its own record: spec on top, receipt at the bottom), replies +
+   resolves every open thread with the landing commits (people who left feedback get closure,
+   not silence), and archives.
 5. For each **partial** canvas: don't archive. Leave a status comment on the canvas instead —
    what landed (with commits), what's still open — so the canvas tracks its own progress and the
    next sweep picks up where this one left off.
 6. A **stale** canvas that was superseded or abandoned: confirm with the human, then archive
    (no receipt — nothing shipped; a one-line "superseded by <x>" note is kinder than nothing).
 
-**The receipt** — append to the canvas body. Markdown:
-
-```markdown
----
-
-## ✅ Shipped — 2026-06-11
-
-Landed in `a1b2c3d`, `e4f5a6b` (drafty-im/drafty) — sweep command, context nudge, skill workflow.
-```
-
-HTML: same content as a small muted footer `<section>` before `</body>` (match the canvas's
-styling; don't break its layout). Keep it to date + commits/PR + one line on what landed.
+**The receipt** — `canvas ship` stamps it, matched to the canvas's format: markdown gets a
+`## ✅ Shipped — <date>` footer ("Landed in `a1b2c3d`, `e4f5a6b` (repo) — one line on what
+landed."), HTML the same content as a small muted `<section>` before `</body>`. The default
+note is the first commit's subject — pass `--note "…"` when that line wouldn't tell the story.
 
 **Bounds:** never sweep pinned canvases (deliberately long-lived — dashboards, living docs);
 `drafty tidy` already excludes them from sweep candidacy. Slug-in-commit evidence only works
