@@ -2,10 +2,18 @@
 
 The out-of-repo `drafty` CLI + skill, shipped as a Claude Code plugin
 (`github.com/drafty-im/drafty`). The CLI is **one file** —
-`plugins/drafty/cli/canvas.ts` (bun-native TypeScript, no build step, no deps
-beyond node/bun builtins) — a thin HTTP/SSE client of the drafty.im web app's
+`plugins/drafty/cli/canvas.ts` (single-file TypeScript on Node builtins, no
+build step, no deps) — a thin HTTP/SSE client of the drafty.im web app's
 public `/get/api/*` + `/api/track` contract. The web app's CLAUDE.md owns the
 server side; keep that contract stable in both directions.
+
+**Dual runtime — keep it that way.** The CLI runs under bun OR plain Node
+≥22.18 (native type stripping); `bin/drafty` picks whichever is on PATH (bun
+first). Hard rules when editing `canvas.ts`: Node builtins only — no `Bun.*`
+globals, no `import.meta.dir` (use `.dirname`) — and only **erasable** TS
+syntax (no enums, no namespaces, no constructor parameter properties).
+preflight greps for bun-isms and boots the binary under both runtimes, so a
+violation fails the gate before it ships.
 
 ## Shipping = pushing (no CI, all local)
 

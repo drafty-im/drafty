@@ -1,13 +1,21 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 // drafty CLI — publish canvases to drafty.im/canvas/<slug>, then read and reply to
 // feedback as Claude.
 //
 // A thin HTTP/SSE client: it holds a per-user guest token (minted by the server,
 // stored under ~/.drafty) and drives everything through the public /get/api
 // endpoints. No InstantDB dependency, no native deps — installs anywhere.
+//
+// Runtime: Node ≥22.18 or bun — Node builtins only, and only erasable TS syntax
+// (no enums/namespaces/parameter properties), so plain `node canvas.ts` works
+// with native type stripping. No bun-only globals or meta fields — preflight
+// greps the source to keep it that way.
 import { basename, dirname, join, resolve } from "node:path";
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, chmodSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createServer } from "node:http";
 
 const BASE_URL = process.env.DRAFTY_BASE_URL || "https://drafty.im";
 const STATE_DIR = join(homedir(), ".drafty");
@@ -95,7 +103,7 @@ const UPDATE_TTL_MS = 24 * 60 * 60 * 1000;
 
 function installedVersion(): string | null {
   try {
-    const p = join(import.meta.dir, "..", ".claude-plugin", "plugin.json");
+    const p = join(import.meta.dirname, "..", ".claude-plugin", "plugin.json");
     return (JSON.parse(readFileSync(p, "utf8")).version as string) || null;
   } catch { return null; }
 }
@@ -403,9 +411,8 @@ async function uploadLocalAssets(content: string, file: string): Promise<string>
   const map = new Map<string, string>();
   for (const ref of refs) {
     const path = resolve(dir, ref.split(/[?#]/)[0]);
-    const f = Bun.file(path);
-    if (!(await f.exists())) { console.error(`  ⚠ skipping missing asset: ${ref}`); continue; }
-    const bytes = new Uint8Array(await f.arrayBuffer());
+    if (!existsSync(path)) { console.error(`  ⚠ skipping missing asset: ${ref}`); continue; }
+    const bytes = new Uint8Array(readFileSync(path));
     const url = await uploadAssetBytes(bytes, refExt(ref));
     map.set(ref, url);
     console.log(`  ⬆ ${ref}`);
@@ -432,7 +439,7 @@ async function uploadLocalAssets(content: string, file: string): Promise<string>
 type ManifestEntry = { slug: string; lastRev: number | null; lastRevisionId: string | null; lastPushedHash: string | null };
 
 function contentHash(content: string): string {
-  return new Bun.CryptoHasher("sha256").update(content).digest("hex");
+  return createHash("sha256").update(content).digest("hex");
 }
 function manifestRootFor(file: string): string {
   let dir = dirname(resolve(file));
@@ -478,7 +485,7 @@ function writeManifestEntry(file: string, entry: ManifestEntry): void {
 async function canvasPush(args: string[]) {
   const file = args[0];
   if (!file) return die("usage: drafty canvas push <file> [--title T] [--slug S] [--mode M] [--format html|markdown] [--project P] [--tag T …] [--refresh]");
-  const content = await Bun.file(file).text();
+  const content = readFileSync(file, "utf8");
   if (!content.trim()) return die(`file is empty: ${file}`);
   // --format html|markdown is an explicit override; otherwise sniff content+extension.
   const formatFlag = flag(args, "format");
@@ -690,7 +697,7 @@ async function canvasStatus(args: string[]) {
   const mf = manifestLookup(file);
   if (!mf.entry?.slug) return die(`${file} has no manifest entry — it hasn't been pushed from here yet`);
   const entry = mf.entry;
-  const content = await Bun.file(file).text();
+  const content = readFileSync(file, "utf8");
   const localDirty = entry.lastPushedHash != null && contentHash(content) !== entry.lastPushedHash;
   const v = await api("canvas.versions", { method: "GET", query: { slug: entry.slug } });
   const canvasMoved = entry.lastRev != null && v.rev != null && v.rev !== entry.lastRev;
@@ -747,11 +754,15 @@ class CdpBrowser {
   private nextId = 1;
   private pending = new Map<number, CdpPending>();
   private sessionEvents = new Map<string, (method: string, params: any) => void>();
-  private constructor(
-    private proc: ReturnType<typeof Bun.spawn>,
-    private ws: WebSocket,
-    private profile: string,
-  ) {
+  // Plain fields + assignments (not constructor parameter properties — those
+  // are non-erasable TS that Node's type stripping rejects).
+  private proc: ChildProcess;
+  private ws: WebSocket;
+  private profile: string;
+  private constructor(proc: ChildProcess, ws: WebSocket, profile: string) {
+    this.proc = proc;
+    this.ws = ws;
+    this.profile = profile;
     ws.onmessage = (ev) => this.onMessage(String(ev.data));
     ws.onclose = () => {
       for (const [, pend] of this.pending) pend.reject(new Error("CDP connection closed"));
@@ -763,9 +774,10 @@ class CdpBrowser {
     const chrome = findChrome();
     if (!chrome) die("no Chrome/Chromium found for local rendering — set DRAFTY_CHROME to a browser binary");
     const profile = join(tmpdir(), `drafty-cdp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
-    const proc = Bun.spawn(
-      [chrome, "--headless=new", "--remote-debugging-port=0", "--no-first-run", "--disable-extensions", "--hide-scrollbars", "--mute-audio", `--user-data-dir=${profile}`, "about:blank"],
-      { stdout: "ignore", stderr: "ignore" },
+    const proc = spawn(
+      chrome,
+      ["--headless=new", "--remote-debugging-port=0", "--no-first-run", "--disable-extensions", "--hide-scrollbars", "--mute-audio", `--user-data-dir=${profile}`, "about:blank"],
+      { stdio: "ignore" },
     );
     // Chrome publishes its ephemeral DevTools port in the profile dir.
     const portFile = join(profile, "DevToolsActivePort");
@@ -894,7 +906,9 @@ class CdpBrowser {
   close() {
     try { this.ws.close(); } catch { /* already closed */ }
     try { this.proc.kill(); } catch { /* already gone */ }
-    rmSync(this.profile, { recursive: true, force: true });
+    // Chrome may still be flushing the profile dir as it dies — retry briefly,
+    // and never let temp-dir cleanup fail the command (the OS reaps /tmp).
+    try { rmSync(this.profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 150 }); } catch { /* best-effort */ }
   }
 }
 
@@ -983,7 +997,7 @@ async function shot(args: string[]) {
   out = out ?? join(tmpdir(), `drafty-shot-${slug}-${r.width}${annotationId ? `-${String(annotationId).slice(0, 8)}` : ""}.jpg`);
   const res = await fetch(r.url);
   if (!res.ok) die(`fetching render failed: ${res.status}`);
-  await Bun.write(out, await res.arrayBuffer());
+  writeFileSync(out, Buffer.from(await res.arrayBuffer()));
   console.error(`  ${r.cached ? "cache hit" : "rendered"} · ${r.width}px${r.revisionId ? ` · revision ${r.revisionId}` : ""} · ${r.url}`);
   console.log(out);
   await track("canvas.shot", { slug, width: r.width, cached: !!r.cached, annotation: !!annotationId });
@@ -1782,8 +1796,8 @@ function gitContext(): { cwd: string; root: string | null; repo: string | null; 
   const cwd = process.cwd();
   const git = (cmd: string[]): string | null => {
     try {
-      const p = Bun.spawnSync(["git", ...cmd], { cwd, stdout: "pipe", stderr: "ignore" });
-      return p.exitCode === 0 ? p.stdout.toString().trim() || null : null;
+      const p = spawnSync("git", cmd, { cwd, stdio: ["ignore", "pipe", "ignore"] });
+      return p.status === 0 ? p.stdout.toString().trim() || null : null;
     } catch { return null; }
   };
   const root = git(["rev-parse", "--show-toplevel"]);
@@ -1819,11 +1833,12 @@ type SweepRow = {
 function gitLogEntries(root: string | null): { sha: string; ts: number; subject: string; text: string }[] {
   if (!root) return [];
   try {
-    const p = Bun.spawnSync(
-      ["git", "log", `--since=${SWEEP_LOG_WINDOW}`, "--pretty=format:%H%x1f%ct%x1f%s%x1f%B%x1e"],
-      { cwd: root, stdout: "pipe", stderr: "ignore" },
+    const p = spawnSync(
+      "git",
+      ["log", `--since=${SWEEP_LOG_WINDOW}`, "--pretty=format:%H%x1f%ct%x1f%s%x1f%B%x1e"],
+      { cwd: root, stdio: ["ignore", "pipe", "ignore"] },
     );
-    if (p.exitCode !== 0) return [];
+    if (p.status !== 0) return [];
     return p.stdout.toString().split("\x1e").map((s) => s.trim()).filter(Boolean).map((rec) => {
       const [sha, ct, subject, body] = rec.split("\x1f");
       return { sha: (sha || "").slice(0, 7), ts: (Number(ct) || 0) * 1000, subject: subject || "", text: body || "" };
@@ -2091,34 +2106,41 @@ async function login() {
 
   const allowOrigin = new URL(BASE_URL).origin;
   const cors = { "access-control-allow-origin": allowOrigin, "access-control-allow-methods": "POST, OPTIONS", "access-control-allow-headers": "content-type", "access-control-allow-private-network": "true" };
-  const json = (b: unknown, status: number, origin: string | null) =>
-    new Response(JSON.stringify(b), { status, headers: { ...cors, "content-type": "application/json", ...(origin === allowOrigin ? { "access-control-allow-origin": origin } : {}) } });
 
-  const server = Bun.serve({
-    port: 0,
-    hostname: "127.0.0.1",
-    async fetch(req) {
-      const origin = req.headers.get("origin");
-      if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: { ...cors, ...(origin === allowOrigin ? { "access-control-allow-origin": origin } : {}) } });
-      const u = new URL(req.url);
-      if (u.pathname !== "/callback" || req.method !== "POST") return json({ ok: false }, 404, origin);
-      if (origin !== allowOrigin) return json({ ok: false }, 403, origin); // only our web origin may hand a token back
+  const server = createServer((req, res) => {
+    const origin = req.headers.origin ?? null;
+    const respond = (status: number, b: unknown) => {
+      res.writeHead(status, { ...cors, "content-type": "application/json", ...(origin === allowOrigin ? { "access-control-allow-origin": origin } : {}) });
+      res.end(JSON.stringify(b));
+    };
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, { ...cors, ...(origin === allowOrigin ? { "access-control-allow-origin": origin } : {}) });
+      return res.end();
+    }
+    const u = new URL(req.url || "/", "http://127.0.0.1");
+    if (u.pathname !== "/callback" || req.method !== "POST") return respond(404, { ok: false });
+    if (origin !== allowOrigin) return respond(403, { ok: false }); // only our web origin may hand a token back
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
       try {
-        const body = (await req.json()) as { token?: string; state?: string };
-        if (body.state !== state || !body.token) return json({ ok: false }, 400, origin);
+        const body = JSON.parse(raw) as { token?: string; state?: string };
+        if (body.state !== state || !body.token) return respond(400, { ok: false });
         // Resolve on the next tick so this 200 flushes to the browser *before*
         // the main flow stops the server — otherwise the page sees a dropped
         // connection and shows a false error even though we got the token.
         const tok = body.token;
         setTimeout(() => resolveCb(tok), 50);
-        return json({ ok: true }, 200, origin);
+        respond(200, { ok: true });
       } catch {
-        return json({ ok: false }, 400, origin);
+        respond(400, { ok: false });
       }
-    },
+    });
   });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
 
-  const d = Buffer.from(JSON.stringify({ port: server.port, state })).toString("base64url");
+  const d = Buffer.from(JSON.stringify({ port, state })).toString("base64url");
   const authUrl = `${BASE_URL}/cli-auth?d=${d}`;
   await track("auth.started", { method: "browser" });
   console.error("Opening your browser to sign in…");
@@ -2127,9 +2149,9 @@ async function login() {
 
   const timer = setTimeout(() => rejectCb(new Error("timed out waiting for the browser — re-run `drafty login`")), 180000);
   let token: string;
-  try { token = await got; } catch (e) { server.stop(true); return die((e as Error).message); }
+  try { token = await got; } catch (e) { server.closeAllConnections(); server.close(); return die((e as Error).message); }
   clearTimeout(timer);
-  server.stop(); // graceful — let the in-flight 200 finish flushing to the browser
+  server.close(); // graceful — let the in-flight 200 finish flushing to the browser
 
   // Valid token in hand — store it first so login can't fail past this point.
   writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
@@ -2159,7 +2181,7 @@ function openBrowser(url: string) {
   const cmd = process.platform === "darwin" ? ["open", url]
     : process.platform === "win32" ? ["cmd", "/c", "start", "", url]
     : ["xdg-open", url];
-  try { Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" }); } catch { /* user can click the printed URL */ }
+  try { spawn(cmd[0], cmd.slice(1), { stdio: "ignore", detached: true }).unref(); } catch { /* user can click the printed URL */ }
 }
 
 // Drop the stored identity; the next command mints a fresh guest.
@@ -2170,6 +2192,15 @@ function logout() {
 }
 
 // ── setup / health ────────────────────────────────────────────────────────────
+// Minimal `which`: first PATH entry holding a file by that name.
+function whichOnPath(name: string): string | null {
+  const sep = process.platform === "win32" ? ";" : ":";
+  for (const dir of (process.env.PATH ?? "").split(sep).filter(Boolean)) {
+    try { const p = join(dir, name); if (statSync(p).isFile()) return p; } catch { /* keep looking */ }
+  }
+  return null;
+}
+
 async function whoami() {
   const r = await api("whoami", { method: "GET" });
   // Keep the marker in step with reality: refresh it when signed in (also clears
@@ -2193,7 +2224,10 @@ async function doctor() {
   console.log("drafty — doctor\n");
 
   const bunV = (globalThis as any).Bun?.version;
-  bunV ? pass("bun runtime", `v${bunV}`) : fail("bun runtime", "not running under bun — install from bun.sh");
+  const nodeV = process.versions?.node;
+  if (bunV) pass("runtime", `bun v${bunV}`);
+  else if (nodeV) pass("runtime", `node v${nodeV}`);
+  else fail("runtime", "needs Node ≥22.18 (nodejs.org) or bun (bun.sh)");
 
   try {
     mkdirSync(STATE_DIR, { recursive: true });
@@ -2209,7 +2243,7 @@ async function doctor() {
   // The setup-registered copies (user-level ~/.claude/skills or a project
   // .claude/) are legacy paths from the pre-plugin era; still honored.
   let skillAt: string | null = null;
-  const bundled = join(import.meta.dir, "..", "skills", "drafty", "SKILL.md");
+  const bundled = join(import.meta.dirname, "..", "skills", "drafty", "SKILL.md");
   if (existsSync(bundled)) skillAt = bundled;
   if (!skillAt && existsSync(SKILL_DST)) skillAt = SKILL_DST;
   for (let dir = process.cwd(); !skillAt; ) {
@@ -2223,7 +2257,7 @@ async function doctor() {
     ? pass(skillAt === bundled ? "skill bundled with the plugin" : "skill installed", skillAt)
     : fail("skill not installed", "run `drafty setup` to register it for Claude Code");
 
-  const launcher = Bun.which("drafty");
+  const launcher = whichOnPath("drafty");
   launcher ? pass("drafty on PATH", launcher) : fail("drafty not on PATH", "run `drafty setup`");
 
   const cur = installedVersion();
@@ -2256,7 +2290,7 @@ async function doctor() {
 }
 
 async function setup() {
-  const cliDir = import.meta.dir;
+  const cliDir = import.meta.dirname;
   console.log("drafty — setup\n");
 
   const skillSrc = join(cliDir, "skill", "SKILL.md");
@@ -2290,9 +2324,10 @@ function installLauncher(cliDir: string): { path: string; binDir: string; onPath
   const binDir = candidates.find((d) => pathDirs.includes(d)) ?? candidates[0];
   mkdirSync(binDir, { recursive: true });
   const launcher = join(binDir, "drafty");
+  const src = join(cliDir, "canvas.ts");
   writeFileSync(
     launcher,
-    `#!/bin/sh\n# drafty CLI launcher — installed by \`drafty setup\`. Works in interactive\n# and non-interactive shells (an alias would not). Source: ${join(cliDir, "canvas.ts")}\nexec bun ${join(cliDir, "canvas.ts")} "$@"\n`,
+    `#!/bin/sh\n# drafty CLI launcher — installed by \`drafty setup\`. Works in interactive\n# and non-interactive shells (an alias would not). Source: ${src}\nif command -v bun >/dev/null 2>&1; then exec bun "${src}" "$@"; fi\nif command -v node >/dev/null 2>&1; then exec node --disable-warning=ExperimentalWarning "${src}" "$@"; fi\necho "drafty: needs Node >=22.18 (https://nodejs.org) or bun (https://bun.sh) on PATH." >&2\nexit 127\n`,
   );
   chmodSync(launcher, 0o755);
   return { path: launcher, binDir, onPath: pathDirs.includes(binDir) };
@@ -2354,7 +2389,7 @@ LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
   drafty login / logout                       sign in (browser; web + CLI) / sign out
   drafty whoami                               show your identity
   drafty setup                                register the skill + launcher, then run doctor
-  drafty doctor                               preflight: bun, state dir, skill, server, identity
+  drafty doctor                               preflight: runtime, state dir, skill, server, identity
 
 Identity starts as a guest token (stored in ~/.drafty); \`drafty login\` upgrades
 it into a real account in place. Point at another server with DRAFTY_BASE_URL.

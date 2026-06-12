@@ -16,6 +16,10 @@
 set -uo pipefail
 CLI="$(cd "$(dirname "$0")/.." && pwd)/plugins/drafty/cli/canvas.ts"
 BASE="${BASE:-https://drafty.im}"
+# Which runtime drives the CLI — both are supported; run the smoke under each
+# when the change touches runtime-sensitive code: RUNTIME=node bash scripts/cli-smoke.sh
+RT="${RUNTIME:-bun}"
+[ "$RT" = "node" ] && RT="node --disable-warning=ExperimentalWarning"
 
 ISO="$(mktemp -d)"; trap 'rm -rf "$ISO"' EXIT
 mkdir -p "$ISO/.drafty"
@@ -30,14 +34,14 @@ else
 fi
 
 WORK="$ISO/work"; mkdir -p "$WORK"
-dcli() { HOME="$ISO" DRAFTY_BASE_URL="$BASE" bun "$CLI" "$@"; }
+dcli() { HOME="$ISO" DRAFTY_BASE_URL="$BASE" $RT "$CLI" "$@"; }
 fails=0; ok(){ echo "  ✓ $1"; }; bad(){ echo "  ✗ $1"; fails=$((fails+1)); }
 
 echo "cli-smoke against $BASE"
 dcli whoami >/dev/null 2>&1 && ok "whoami" || bad "whoami"
 printf "# cli-smoke\n\nround-trip bytes\n" > "$WORK/s.md"
 ( cd "$WORK" && dcli canvas push s.md --title "cli-smoke" --private ) >/dev/null 2>&1 && ok "push" || bad "push"
-slug="$(cd "$WORK" && python3 -c "import json;print(json.load(open('.drafty/manifest.json'))['files']['s.md']['slug'])" 2>/dev/null)"
+slug="$(cd "$WORK" && python3 -c "import json;d=json.load(open('.drafty/manifest.json'));d=d.get('files',d);print(d['s.md']['slug'])" 2>/dev/null)"
 if [ -n "$slug" ]; then
   [ "$(dcli canvas pull "$slug" 2>/dev/null)" = "$(printf '# cli-smoke\n\nround-trip bytes\n')" ] && ok "pull byte-match" || bad "pull mismatch"
   dcli canvas rm "$slug" --yes >/dev/null 2>&1 && ok "rm (cleanup)" || bad "rm"

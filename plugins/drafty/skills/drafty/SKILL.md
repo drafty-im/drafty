@@ -85,10 +85,11 @@ exactly as authored (e.g. `<meta name="color-scheme" content="light">`).
 ## Setup
 
 Installed via the **Drafty plugin** — the `drafty` command is already on PATH in
-this session (it ships in the plugin's `bin/`). Requires [bun](https://bun.sh).
-Just run `drafty <command>`; there's no separate setup step.
+this session (it ships in the plugin's `bin/`). Runs on Node 22.18+ or
+[bun](https://bun.sh), whichever is on PATH. Just run `drafty <command>`;
+there's no separate setup step.
 
-- `drafty doctor` — sanity-check the environment (bun, state dir, Instant reachable).
+- `drafty doctor` — sanity-check the environment (runtime, state dir, server reachable).
 - `drafty whoami` — show your identity.
 
 **Sign in first.** Plugin commands run on the human's real account — there's no

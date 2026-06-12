@@ -10,7 +10,7 @@
 /reload-plugins
 ```
 
-Or just ask in a Claude Code session — *"install the drafty-im/drafty plugin"* — and Claude runs those for you. `/reload-plugins` switches everything on live (the `drafty` skill and the `drafty` command on PATH), no restart. Requires [bun](https://bun.sh). Sign in once with `drafty login` — Claude prompts you the first time you publish.
+Or just ask in a Claude Code session — *"install the drafty-im/drafty plugin"* — and Claude runs those for you. `/reload-plugins` switches everything on live (the `drafty` skill and the `drafty` command on PATH), no restart. Runs on Node 22.18+ or [bun](https://bun.sh) — whichever is already on PATH, no build step. Sign in once with `drafty login` — Claude prompts you the first time you publish.
 
 ## Capabilities
 

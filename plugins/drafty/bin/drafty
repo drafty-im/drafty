@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Drafty launcher. While the plugin is enabled this is on the Bash tool's PATH,
-# so `drafty <command>` just works — no separate `setup` step. Requires `bun`
-# (https://bun.sh).
+# so `drafty <command>` just works — no separate `setup` step. Runs under bun
+# (https://bun.sh) or Node ≥22.18 — whichever is on PATH.
 #
 # Self-resolving shim: rather than run *this* copy's CLI, it finds the newest
 # installed plugin version in the cache and runs that. So a plugin update is
@@ -26,9 +26,24 @@ if [ -z "$newest" ] || [ ! -f "$root/cli/canvas.ts" ]; then
   root="$(cd "$self/.." && pwd)"
 fi
 
-if ! command -v bun >/dev/null 2>&1; then
-  echo "drafty: needs 'bun' on PATH — install it from https://bun.sh, then retry." >&2
+# Runtime: prefer bun (the historical runtime — what existing installs already
+# have, fastest start), else Node ≥22.18 / 23.6+ / 24+, which runs single-file
+# TypeScript natively (the flag silences the type-stripping ExperimentalWarning
+# on the 22.x line). Claude Code's native installer guarantees NEITHER runtime,
+# so when both are missing the error must say exactly what to install.
+if command -v bun >/dev/null 2>&1; then
+  exec bun "$root/cli/canvas.ts" "$@"
+fi
+if command -v node >/dev/null 2>&1; then
+  v="$(node --version 2>/dev/null || true)"; v="${v#v}"
+  major="${v%%.*}"; rest="${v#*.}"; minor="${rest%%.*}"
+  if [ "${major:-0}" -ge 24 ] 2>/dev/null \
+     || { [ "${major:-0}" -eq 23 ] && [ "${minor:-0}" -ge 6 ]; } 2>/dev/null \
+     || { [ "${major:-0}" -eq 22 ] && [ "${minor:-0}" -ge 18 ]; } 2>/dev/null; then
+    exec node --disable-warning=ExperimentalWarning "$root/cli/canvas.ts" "$@"
+  fi
+  echo "drafty: your node (v$v) is too old to run TypeScript directly — needs Node >=22.18 (https://nodejs.org), or install bun (https://bun.sh)." >&2
   exit 127
 fi
-
-exec bun "$root/cli/canvas.ts" "$@"
+echo "drafty: needs Node >=22.18 (https://nodejs.org) or bun (https://bun.sh) on PATH." >&2
+exit 127
