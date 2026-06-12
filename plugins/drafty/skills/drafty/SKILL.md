@@ -365,6 +365,14 @@ when ships mention the canvas URL — keep doing that (see **Archive on ship** a
   re-push, and `resolve` each as you finish. The anchor's `anchorText` tells you
   exactly which element the comment targets.
 
+**Editing while threads are open: keep commented blocks recognizable.** Comment
+pins re-anchor to their element by text similarity on every push — revise a
+commented block in place and the pin follows, but a from-scratch rewrite of that
+block (or deleting it) orphans its thread into the rail's "removed" state.
+Restructure freely; just prefer editing a commented element's text over
+replacing the element wholesale, and reply/resolve a thread before deleting the
+block it points at.
+
 **Comments on a spot of an image / screenshot (point anchors)**
 When someone comments on a precise point of an opaque visual (an image, a pasted
 screenshot, `canvas`/`svg`/`video`), the thread carries `anchorFx`/`anchorFy` — a
