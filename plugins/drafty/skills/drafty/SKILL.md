@@ -143,8 +143,9 @@ the update unprompted, since it changes their environment.
 | `drafty shot <slug>\|<file.html>\|<url> [--width N] [--revision <id>] [--annotation <id>] [--full] [-o out]` | **Render to an image and print its path** — your eyes. A local file/URL renders via headless Chrome on this machine; a public canvas renders via the server (cached per revision×width); a private canvas auto-falls back to rendering pulled content locally. `--annotation <id>` reproduces a commenter's exact view (their width + revision, anchored element highlighted). Read the printed path to *see* it. |
 | `drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b…] [--slug S] [--refresh] [--dry-run]` | **Site board**: map a website (its own robots/sitemap/homepage — no crawling), curate up to 20 main screens, shoot each at desktop+phone width with local Chrome, and publish an annotatable board canvas. `--dry-run` previews the screen list; `--urls` overrides curation; `--slug <board> --refresh` re-shoots the same screens as a tick (self-refreshing board). |
 | `drafty context [--limit N] [--archived] [--json]` | **Orientation in one call** — identity, local git repo/branch, the projects + tags already in use (with counts), and the most-recent canvases (capped to ~15; `--limit 0` for all). Run it before a push/update to pick the project, reuse tags, and decide create-vs-update. |
-| `drafty canvas ls [--project P] [--tag T] [--unfiled] [--archived] [--json]` | The filtered / full list — **newest first**, the same order as the web home and `drafty context`, each row showing project · `#tags` · open-thread count. Orient with `drafty context` first; reach for `ls` to **drill in or filter**: `--project "<name>"`, `--tag <label>`, `--unfiled` (missing a project or tags), `--archived`. |
+| `drafty canvas ls [--project P] [--tag T] [--unfiled] [--archived\|--all] [--json]` | The filtered / full list — **newest first**, the same order as the web home and `drafty context`, each row showing project · `#tags` · open-thread count. Orient with `drafty context` first; reach for `ls` to **drill in or filter**: `--project "<name>"`, `--tag <label>`, `--unfiled` (missing a project or tags), `--archived` (just the shelf), `--all` (active + archived). |
 | `drafty sweep [--project P] [--json]` | **Reconcile canvases with shipped code** — evidence, not verdicts. Flags active canvases that *look shipped* (slug referenced in a commit of the cwd repo after the canvas last changed) or *look stale* (idle 3+ weeks, no open threads); pinned canvases are never candidates. Run it from the repo so git evidence is available. You judge each candidate, then receipt → close threads → archive (see **The sweep** below). |
+| `drafty tidy [--json]` | **One audit pass over canvas metadata** (alias: `drafty audit`) — unfiled canvases (archived included), junk candidates (blank/untitled), tag drift (plural twins, one-off tags), plus the sweep counts, in a single work-list. Detection only: you classify each finding, file with `canvas set`, and propose junk deletions to the human (see **Tidy-up pass** below). |
 | `drafty changelog [--json]` | What shipped on Drafty, grouped by week (public feed; no sign-in needed). Use when the human asks "what's new in drafty". |
 | `drafty login` | Sign the human in — opens their browser; one sign-in covers web + CLI, and any canvases made before signing in fold into the account. `drafty logout` signs out. |
 | `drafty canvas claim <slug>` | Take ownership of a *provisional* canvas (one minted by `/get/provision`) so it stops being ephemeral and lists under the human's account. Requires being signed in (`drafty login` first); authorize the transfer with the canvas's provision token: `DRAFTY_TOKEN=<provision token> drafty canvas claim <slug>`. Only when the human asks to keep it. |
@@ -271,15 +272,26 @@ in with `drafty canvas ls --project <name>` when you need more.
 `archive` it. This is the human's list — infer sensibly, fix on correction, and never nag about it.
 
 **Tidy-up pass** — when the human asks to "organize/file my canvases", "fix up the unfiled
-ones", or "tidy up" (and `drafty context` shows an *Unfiled* count):
+ones", "audit my canvases", or "tidy up" (and `drafty context` shows an *Unfiled* count):
 
-1. `drafty canvas ls --unfiled --json` — the work-list (canvases missing a project or tags). Each row
-   carries `title` + `description`, which is usually enough to classify without opening it;
+1. `drafty tidy --json` — the whole work-list in one call: **unfiled** canvases (no project or
+   no tags — archived ones included, since project/tag filters span the shelf too), **junk
+   candidates** (blank/untitled), **tag drift** (a tag and its plural side by side; one-off
+   tags that are usually a synonym of an established one), and the sweep counts. Each unfiled
+   row carries `title` + `description`, which is usually enough to classify without opening it;
    `drafty canvas pull <slug>` only if you need the body.
 2. `drafty context` once up front for the existing project/tag vocabulary — **reuse it**, don't
-   coin near-duplicates.
-3. For each, set everything in one call: `drafty canvas set <slug> --project <initiative> --tag <kind>`.
-   Leave a canvas alone if you genuinely can't tell — don't guess a wrong project.
+   coin near-duplicates. Default project = the repo the work happened in.
+3. For each unfiled canvas, set everything in one call:
+   `drafty canvas set <slug> --project <initiative> --tag <kind>`.
+   Leave a canvas alone if you genuinely can't tell — don't guess a wrong project — and respect
+   deliberate choices (a personal cross-project list with tags but no project is filed, not lost).
+4. Tag drift: merge with `drafty canvas set <slug> --tag <keep> --untag <drop>` — keep the
+   spelling with more uses.
+5. Junk candidates: **propose, never delete.** `drafty canvas rm` is permanent; list them for the
+   human and only `rm --yes` on their say-so.
+6. If the tidy report shows sweep candidates, offer the sweep (next section) as a follow-up —
+   filing and reconciling-with-shipped-code are separate passes.
 
 (And note: `drafty doctor` is a *setup* health check — PATH, token, server — it never touches
 canvas data.)
@@ -295,7 +307,9 @@ left to rot on the list, and not silently hidden either. The sweep is that recon
    look shipped — want me to sweep?"* Don't silently ignore the line; don't silently act on it.
 2. **Ship moment.** You just merged/deployed work that a canvas describes → run the micro-sweep
    for that canvas right away, no confirmation needed (your own merge is the evidence).
-3. **On demand.** "sweep my canvases", "tidy drafty", "which of these shipped?" → full sweep.
+3. **On demand.** "sweep my canvases", "which of these shipped?" → full sweep. (A general
+   "tidy/audit my canvases" starts with `drafty tidy` — the **Tidy-up pass** above — which ends
+   by offering the sweep when there are candidates.)
 
 **The workflow:**
 1. `drafty sweep --json` **from the relevant repo** (commit evidence comes from the cwd's git

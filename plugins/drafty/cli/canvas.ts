@@ -563,6 +563,13 @@ async function canvasPush(args: string[]) {
     if (summary) console.log(`  ${summary}`);
   }
 
+  // Born unfiled — one line with the likely project (the cwd repo) so the
+  // agent files it now instead of leaving it for a later tidy pass.
+  if (r.created && project === undefined && !tags.length) {
+    const repo = gitContext().repo;
+    console.log(`  unfiled — file it: drafty canvas set ${r.slug} --project ${repo ?? "<name>"} --tag <kind>`);
+  }
+
   if (r.created && r.mode === "feedback") {
     console.log(`  Claude waits for your go — run \`drafty canvas mode ${r.slug} live\` to work comments live`);
   }
@@ -1727,7 +1734,11 @@ async function canvasLs(args: string[] = []) {
   const r = await api("canvas.ls", { method: "GET" });
   let items = r.items as any[];
 
-  if (!has(args, "archived") && !has(args, "all")) items = items.filter((d) => !d.archived);
+  // Scope: active by default, --archived = just the shelf, --all = everything.
+  // (--archived used to mean "include archived too", which forced callers to
+  // diff two lists by hand to see what's actually shelved.)
+  if (has(args, "archived")) items = items.filter((d) => d.archived);
+  else if (!has(args, "all")) items = items.filter((d) => !d.archived);
   const projectFilter = flag(args, "project");
   if (projectFilter !== undefined) items = items.filter((d) => (d.project || "") === projectFilter);
   const tagFilter = flag(args, "tag");
@@ -1888,6 +1899,81 @@ async function sweep(args: string[] = []) {
   console.log(`shipped canvas: stamp a Shipped receipt (pull → append → push), reply + resolve its open`);
   console.log(`threads with the landing commit, then \`drafty canvas archive <slug>\`. Propose the list`);
   console.log(`to the human first unless you shipped the work yourself this session.`);
+}
+
+// ── tidy — one audit pass over canvas metadata ───────────────────────────────
+// The mechanical half of "tidy my canvases": every metadata anomaly in one
+// report — unfiled canvases (no project or no tags, archived included: filters
+// span the shelf too), junk candidates (untitled/blank titles), and tag drift
+// (plural twins, one-off tags) — plus the sweep counts. The CLI detects;
+// classification (which project, which tags merge, what's truly junk) is the
+// agent's judgment, and deleting anything is the human's call.
+async function tidy(args: string[] = []) {
+  const r = await api("canvas.ls", { method: "GET" });
+  const all = (r.items as any[]) || [];
+  const active = all.filter((d) => !d.archived);
+  const git = gitContext();
+
+  const isUnfiled = (d: any) => !d.project || !(Array.isArray(d.tags) && d.tags.length);
+  const isJunk = (d: any) => !(d.title || "").trim() || /^untitled\b/i.test((d.title || "").trim());
+  const unfiled = all
+    .filter((d) => isUnfiled(d) && !isJunk(d))
+    .sort((a, b) => Number(!!a.archived) - Number(!!b.archived) || (b.updatedAt || 0) - (a.updatedAt || 0));
+  const junk = all.filter(isJunk);
+
+  // Tag drift: a tag and its plural living side by side, and tags used exactly
+  // once (synonym suspects — `plan` at 12 next to `proposal` at 1). String
+  // heuristics only; whether they actually mean the same thing is judgment.
+  const tagCount = new Map<string, number>();
+  for (const d of all) for (const t of Array.isArray(d.tags) ? d.tags : []) tagCount.set(t, (tagCount.get(t) || 0) + 1);
+  const pluralTwins = [...tagCount.keys()].filter((t) => tagCount.has(`${t}s`)).map((t) => ({ a: t, an: tagCount.get(t)!, b: `${t}s`, bn: tagCount.get(`${t}s`)! }));
+  const singletons = tagCount.size >= 4 ? [...tagCount.entries()].filter(([, n]) => n === 1).map(([t]) => t).sort() : [];
+
+  const sweepRows = sweepEvidence(active, gitLogEntries(git.root));
+  const looksShipped = sweepRows.filter((x) => x.looksShipped).length;
+  const looksStale = sweepRows.filter((x) => x.looksStale).length;
+
+  await track("tidy.run", { unfiled: unfiled.length, junk: junk.length, plural_twins: pluralTwins.length, singletons: singletons.length, looks_shipped: looksShipped, looks_stale: looksStale });
+
+  if (has(args, "json")) {
+    const row = (d: any) => ({ slug: d.slug, title: d.title, description: d.description || null, project: d.project || null, tags: Array.isArray(d.tags) ? d.tags : [], archived: !!d.archived, updatedAt: d.updatedAt || 0 });
+    console.log(JSON.stringify({
+      local: git,
+      counts: { active: active.length, archived: all.length - active.length },
+      unfiled: unfiled.map(row),
+      junk: junk.map(row),
+      tags: { tally: [...tagCount.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count), pluralTwins, singletons },
+      sweep: { looksShipped, looksStale },
+    }, null, 2));
+    return;
+  }
+
+  console.log(`Tidy — ${active.length} active, ${all.length - active.length} archived${git.repo ? `  ·  git: ${git.repo} @ ${git.branch}` : ""}`);
+  const clean = !unfiled.length && !junk.length && !pluralTwins.length && !looksShipped && !looksStale;
+  if (clean) {
+    console.log("\n✓ nothing to tidy — every canvas is filed, titled, and current" + (singletons.length ? ` (one-off tags worth a look: ${singletons.map((t) => `#${t}`).join(" ")})` : ""));
+    return;
+  }
+
+  if (unfiled.length) {
+    console.log(`\nUnfiled (${unfiled.length}) — missing a project or tags; file each with \`drafty canvas set <slug> --project P --tag T\`:`);
+    for (const d of unfiled) console.log(`  ${d.slug}  ${d.title}${d.archived ? "  · archived" : ""}${d.project ? `  · ▸ ${d.project}` : ""}${Array.isArray(d.tags) && d.tags.length ? `  · ${d.tags.map((t: string) => `#${t}`).join(" ")}` : ""}`);
+  }
+  if (junk.length) {
+    console.log(`\nJunk candidates (${junk.length}) — blank/untitled; confirm with the human before \`drafty canvas rm <slug> --yes\`:`);
+    for (const d of junk) console.log(`  ${d.slug}  "${d.title}"${d.archived ? "  · archived" : ""}  · updated ${relTime(d.updatedAt || 0)}`);
+  }
+  if (pluralTwins.length || singletons.length) {
+    console.log(`\nTag drift — same meaning, different labels splinter the filters:`);
+    for (const p of pluralTwins) console.log(`  #${p.a} (${p.an}) and #${p.b} (${p.bn}) — merge? \`drafty canvas set <slug> --tag ${p.an >= p.bn ? p.a : p.b} --untag ${p.an >= p.bn ? p.b : p.a}\``);
+    if (singletons.length) console.log(`  one-off tags (synonym suspects): ${singletons.map((t) => `#${t}`).join(" ")}`);
+  }
+  if (looksShipped || looksStale) {
+    console.log(`\nSweep: ${looksShipped} look shipped, ${looksStale} look stale → \`drafty sweep\` for the evidence (judge each before archiving).`);
+  }
+  console.log(`\nDetection only — classify with your own read (titles/descriptions usually suffice;`);
+  console.log(`\`drafty canvas pull <slug>\` if not), reuse the existing project/tag vocabulary`);
+  console.log(`(\`drafty context\`), and propose junk deletions to the human — never rm unasked.`);
 }
 
 // One-shot orientation: who you are, where you are (git), the projects + tags
@@ -2239,7 +2325,7 @@ const HELP = `drafty — publish canvases for annotation, read & reply to the co
 
 CANVAS — the canvas you publish
   drafty canvas push <file> [--title T] [--slug S] [--mode M] [--visibility public|authed|invite] [--private] [--project P] [--tag T …]   publish/update + file it
-  drafty canvas ls [--project P] [--tag T] [--unfiled] [--archived] [--json]   list your canvases
+  drafty canvas ls [--project P] [--tag T] [--unfiled] [--archived|--all] [--json]   list your canvases (--archived = just the shelf)
   drafty canvas show <slug>                meta: title, link, project, tags, mode, threads
   drafty canvas pull <slug> [--revision id] [-o f]   download the content
   drafty canvas versions <slug> [--json]   list a canvas's versions, newest first
@@ -2278,6 +2364,7 @@ LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
   drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b…] [--slug S] [--refresh] [--dry-run]   site board: map → curate → shoot → annotatable canvas
   drafty context [--limit N] [--archived] [--json]   one-shot orientation: identity, git, projects, tags + recent canvases
   drafty sweep [--project P] [--json]         reconcile canvases with shipped code: which look shipped (slug in a commit) or stale
+  drafty tidy [--json]                        one audit pass: unfiled canvases, junk titles, tag drift + sweep counts in a single work-list
   drafty changelog [--json]                   what shipped, by week
   drafty login / logout                       sign in (browser; web + CLI) / sign out
   drafty whoami                               show your identity
@@ -2307,7 +2394,7 @@ const COMMENTS: Record<string, Cmd> = {
 const MARKS: Record<string, Cmd> = { ls: marksLs, rm: marksRm };
 const LINK: Record<string, Cmd> = { create: linkCreate, ls: linkLs, rm: linkRm };
 // Top-level: session / meta — not scoped to a canvas or a comment.
-const TOP: Record<string, Cmd> = { context, changelog, login, logout, whoami, setup, doctor, shot, sweep, present };
+const TOP: Record<string, Cmd> = { context, changelog, login, logout, whoami, setup, doctor, shot, sweep, tidy, audit: tidy, present };
 
 function runGroup(name: string, table: Record<string, Cmd>, args: string[]) {
   const [verb, ...rest] = args;
