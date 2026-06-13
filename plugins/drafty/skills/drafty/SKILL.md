@@ -149,6 +149,13 @@ the update unprompted, since it changes their environment.
 | `drafty changelog [--json]` | What shipped on Drafty, grouped by week (public feed; no sign-in needed). Use when the human asks "what's new in drafty". |
 | `drafty login` | Sign the human in — opens their browser; one sign-in covers web + CLI, and any canvases made before signing in fold into the account. `drafty logout` signs out. |
 | `drafty canvas claim <slug>` | Take ownership of a *provisional* canvas (one minted by `/get/provision`) so it stops being ephemeral and lists under the human's account. Requires being signed in (`drafty login` first); authorize the transfer with the canvas's provision token: `DRAFTY_TOKEN=<provision token> drafty canvas claim <slug>`. Only when the human asks to keep it. |
+| `drafty resolve <link> [--json]` | Print the canvas behind any drafty link — a bare slug, a `drafty.im/canvas/<slug>` URL, or a `drafty.im/l/<code>` short link (the CLI follows the short-link redirect itself). Slug on stdout, full URL on stderr. |
+
+**Anywhere a command takes `<slug>`, paste what the human gave you as-is** — a
+bare slug, a full `drafty.im/canvas/<slug>` URL (query/hash and all), or a
+`drafty.im/l/<code>` short link. Every slug-taking command resolves it for you, so
+**never curl a short link to find its slug** — just pass it straight to `pull` /
+`comments ls` / `show` / `shot` / …, or run `drafty resolve <link>` to see the slug.
 
 **Managing a canvas** (owner-only — you can delete anything on a canvas you published):
 

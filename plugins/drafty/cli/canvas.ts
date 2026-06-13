@@ -298,6 +298,60 @@ function die(msg: string): never {
   process.exit(1);
 }
 
+// ── canvas refs: accept a slug, a long URL, a short link, or a host-relative path ─
+// A command's <slug> arg gets pasted in whatever shape the human has on hand:
+//   • bare slug:            launch-plan-9fk2q
+//   • full canvas URL:      https://drafty.im/canvas/launch-plan-9fk2q?ref=cli
+//   • short link:           https://drafty.im/l/at7cqt   (302 → /canvas/<slug>)
+//   • host-relative path:   /canvas/launch-plan-9fk2q  ·  /l/at7cqt
+// Long forms are pure string-parsing; only a short link needs a network hop — we
+// follow its 302 ourselves so the agent never has to curl the redirect by hand.
+
+// The <code> out of any /l/<code> shape (URL, host-relative, or bare l/<code>), else null.
+function shortlinkCode(input: string): string | null {
+  const m = input.trim().match(/(?:^|\/)l\/([a-z0-9]+)\b/i);
+  return m ? m[1] : null;
+}
+// The canvas slug out of a bare token or a …/canvas/<slug> URL/path. null when the
+// input is a short link (resolve it first) or an unrecognized URL shape.
+function slugFromRef(input: string): string | null {
+  const s = input.trim().replace(/^[<"'\s]+|[>"'\s]+$/g, ""); // strip wrapping <>, quotes
+  if (!s || shortlinkCode(s)) return null;
+  const m = s.match(/\/canvas\/([^/?#]+)/i);
+  if (m) return decodeURIComponent(m[1]);
+  if (!s.includes("/")) return s.split(/[?#]/)[0]; // bare slug/id (may carry ?ref / #frag)
+  return null; // a URL/path that isn't /canvas/<slug> — refuse to guess
+}
+// Resolve a /l/<code> short link to its canvas slug by following the 302 we'd
+// otherwise hand the agent to curl. The bot-labeled UA keeps these resolutions
+// out of the human shortlink-click counts (the redirect classifies by UA).
+async function resolveShortlink(code: string): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE_URL}/l/${encodeURIComponent(code)}`, {
+      method: "GET",
+      redirect: "manual",
+      headers: { "user-agent": `drafty-cli/${installedVersion() ?? "0"} (resolve; bot)` },
+    });
+  } catch (e: any) {
+    return die(`couldn't resolve /l/${code}: ${String(e?.message || e)}`);
+  }
+  // Unknown/disabled codes 302 to the homepage (no /canvas/…) — treat as not-found.
+  const slug = res.headers.get("location") ? slugFromRef(res.headers.get("location")!) : null;
+  if (!slug) return die(`no canvas behind /l/${code} — the short link is unknown, disabled, or points somewhere other than a canvas`);
+  return slug;
+}
+// Resolve any canvas ref to its slug. Pass-through for falsy / --flag inputs so a
+// command's own usage-guard still fires; short links hit the network, the rest are pure.
+async function resolveSlug(input: string | undefined): Promise<string> {
+  if (!input || input.startsWith("--")) return input as string;
+  const code = shortlinkCode(input);
+  if (code) return resolveShortlink(code);
+  const slug = slugFromRef(input);
+  if (slug) return slug;
+  return die(`couldn't read a canvas from "${input}" — paste a slug, a ${BASE_URL}/canvas/<slug> link, or a ${BASE_URL}/l/<code> short link`);
+}
+
 // ── transport ────────────────────────────────────────────────────────────────
 // Establish (or restore) this machine's guest identity. The server mints a real
 // Instant guest and hands back its refresh token; we store the opaque string and
@@ -592,7 +646,7 @@ async function canvasPush(args: string[]) {
 }
 
 async function commentsLs(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug) return die("usage: drafty comments ls <slug> [--json] [--open]");
   const r = await api("comments.ls", { method: "GET", query: { slug } });
   let anns = r.annotations as any[];
@@ -638,7 +692,8 @@ async function commentsStatus(args: string[], status: "open" | "completed") {
 }
 
 async function canvasRestore(args: string[]) {
-  const [slug, revisionId] = args;
+  const [rawSlug, revisionId] = args;
+  const slug = await resolveSlug(rawSlug);
   if (!slug || !revisionId) return die("usage: drafty canvas restore <slug> <revisionId>");
   await api("canvas.restore", { body: { slug, revisionId } });
   console.log(`✓ restored ${slug} to revision ${revisionId}`);
@@ -661,7 +716,7 @@ async function canvasRevert(args: string[]) {
     slug = mf.entry.slug;
     file = target;
   } else {
-    slug = target;
+    slug = await resolveSlug(target);
   }
   let to = flag(args, "to");
   if (!to) {
@@ -934,9 +989,13 @@ async function localShot(target: string, opts: { width: number; height: number; 
 }
 
 async function shot(args: string[]) {
-  const target = args[0];
+  let target = args[0];
   if (!target || target.startsWith("--"))
     return die("usage: drafty shot <slug|file.html|url> [--width N] [--height N] [--revision R] [--annotation A] [--full] [-o out]");
+  // A pasted drafty canvas link or /l/<code> short link → resolve to the bare slug
+  // so it renders through the server path (private-aware, annotation highlight),
+  // not as a live-page screenshot. Bare slugs, local files, and other URLs pass through.
+  if (shortlinkCode(target) || /\/canvas\//i.test(target)) target = await resolveSlug(target);
   const widthFlag = flag(args, "width");
   const heightFlag = flag(args, "height");
   const full = has(args, "full");
@@ -1401,7 +1460,7 @@ async function present(args: string[]) {
 // pipes/redirects cleanly; metadata goes to stderr. --revision pulls a past
 // version (ids come from `drafty canvas versions`); -o/--out writes a file instead.
 async function canvasPull(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug || slug.startsWith("--")) return die("usage: drafty canvas pull <slug> [--revision <id>] [-o <file>] [--json]");
   const revisionId = flag(args, "revision") || flag(args, "rev");
   const outIdx = args.indexOf("-o");
@@ -1425,7 +1484,7 @@ async function canvasPull(args: string[]) {
 }
 
 async function canvasVersions(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug || slug.startsWith("--")) return die("usage: drafty canvas versions <slug> [--json]");
   const r = await api("canvas.versions", { method: "GET", query: { slug } });
   const revs = r.revisions as any[];
@@ -1446,7 +1505,7 @@ async function canvasVersions(args: string[]) {
 // data-key). Refresh scripts read these back to filter the next render:
 //   DONE=$(drafty marks ls <slug> --kind done --json | jq -r '.items[].dataKey')
 async function marksLs(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug || slug.startsWith("--")) return die("usage: drafty marks ls <slug> [--kind <kind>] [--json]");
   const kind = flag(args, "kind");
   const r = await api("marks.ls", { method: "GET", query: { slug, ...(kind ? { kind } : {}) } });
@@ -1470,7 +1529,7 @@ async function marksRm(args: string[]) {
 }
 
 async function canvasMode(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   const mode = parseMode(args[1]);
   if (!slug || !mode) return die(`usage: drafty canvas mode <slug> <${MODES.join("|")}>`);
   await api("canvas.mode", { body: { slug, mode } });
@@ -1480,7 +1539,7 @@ async function canvasMode(args: string[]) {
 
 // Change who can view an existing canvas. `private` is sugar for `invite`.
 async function canvasVisibility(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   const raw = args[1] === "private" ? "invite" : args[1];
   if (!slug || !raw) return die(`usage: drafty canvas visibility <slug> <${VISIBILITIES.join("|")}|private>`);
   if (!(VISIBILITIES as readonly string[]).includes(raw)) die(`visibility must be one of: ${VISIBILITIES.join(", ")} (or private)`);
@@ -1492,7 +1551,7 @@ async function canvasVisibility(args: string[]) {
 // Archive/unarchive: a hide flag. Archived canvases keep their status but drop
 // out of `drafty canvas ls` and are parked for the Claude loop — the link still works.
 async function canvasArchive(args: string[], archived: boolean) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug || slug.startsWith("--")) return die(`usage: drafty canvas ${archived ? "archive" : "unarchive"} <slug>`);
   await api("canvas.set", { body: { slug, archived } });
   if (archived) console.log(`✓ archived ${slug} — hidden from \`drafty canvas ls\` (link still opens); show with --archived`);
@@ -1506,7 +1565,7 @@ async function canvasArchive(args: string[], archived: boolean) {
 // re-run on a half-finished close: a receipt that already names every given
 // commit isn't stamped twice, and resolved threads are skipped.
 async function canvasClose(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   const commits = multiFlag(args, "commit");
   if (!slug || slug.startsWith("--") || !commits.length)
     return die('usage: drafty canvas close <slug> --commit <sha>[,<sha>…] [--note "<one line>"] [--repo <name>]');
@@ -1576,7 +1635,7 @@ async function canvasClose(args: string[]) {
 // (between Live and Recent) so a long-lived canvas never sinks into Recent as newer
 // ones publish. Orthogonal to status/archive — it only affects list position.
 async function canvasPin(args: string[], pinned: boolean) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug || slug.startsWith("--")) return die(`usage: drafty canvas ${pinned ? "pin" : "unpin"} <slug>`);
   await api("canvas.set", { body: { slug, pinned } });
   if (pinned) console.log(`✓ pinned ${slug} — held in the Pinned lane on your home, above Recent`);
@@ -1587,7 +1646,7 @@ async function canvasPin(args: string[], pinned: boolean) {
 // `tag` adds, `untag` removes (or --all clears). The server normalises + dedupes
 // and returns the resulting set, which we echo back.
 async function canvasTag(args: string[], add: boolean) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug || slug.startsWith("--")) {
     return die(add ? "usage: drafty canvas tag <slug> <label> [label…]" : "usage: drafty canvas untag <slug> <label> [label…]   (or --all)");
   }
@@ -1606,7 +1665,7 @@ async function canvasTag(args: string[], add: boolean) {
 // (remove), --clear-tags. The primitive for filing one canvas or a whole tidy-up
 // pass (`canvas ls --unfiled`).
 async function canvasSet(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug || slug.startsWith("--")) {
     return die("usage: drafty canvas set <slug> [--project P | --no-project] [--tag T…] [--untag T…] [--clear-tags]");
   }
@@ -1624,7 +1683,7 @@ async function canvasSet(args: string[]) {
 }
 
 async function commentsInbox(args: string[]) {
-  const slug = args.find((a) => !a.startsWith("--"));
+  const slug = await resolveSlug(args.find((a) => !a.startsWith("--")));
   const scope = has(args, "all") ? "all" : "live";
   const query: Record<string, string> = { scope };
   if (slug) query.slug = slug;
@@ -1647,7 +1706,7 @@ async function commentsInbox(args: string[]) {
 }
 
 async function commentsWatch(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug) return die("usage: drafty comments watch <slug> [--json] [--backlog]");
   const asJson = has(args, "json");
   const token = await getToken();
@@ -1718,7 +1777,7 @@ function requireYes(args: string[], what: string) {
 }
 
 async function canvasRename(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   const title = args.slice(1).filter((a) => !a.startsWith("--")).join(" ").trim();
   if (!slug || !title) return die('usage: drafty canvas rename <slug> "<new name>"');
   await api("canvas.rename", { body: { slug, title } });
@@ -1765,6 +1824,20 @@ async function linkRm(args: string[]) {
   console.log(`✓ removed /l/${code}`);
 }
 
+// Resolve any drafty link to the canvas behind it — a slug, a /canvas/<slug>
+// URL, or a /l/<code> short link. The point: paste a short link and get the
+// canvas without curling the redirect. Slug on stdout (so it pipes:
+// `drafty canvas pull "$(drafty resolve <link>)"`), the full URL on stderr.
+async function resolveCmd(args: string[]) {
+  const input = args[0];
+  if (!input || input.startsWith("--"))
+    return die("usage: drafty resolve <slug|canvas-url|short-link>   — print the canvas behind any drafty link");
+  const slug = await resolveSlug(input);
+  if (has(args, "json")) { console.log(JSON.stringify({ slug, url: url(slug) })); return; }
+  console.error(`# ${url(slug)}`);
+  console.log(slug);
+}
+
 async function commentsRmReply(args: string[]) {
   const commentId = args[0];
   if (!commentId) return die("usage: drafty comments rm-reply <commentId>");
@@ -1780,7 +1853,7 @@ async function commentsRm(args: string[]) {
 }
 
 async function commentsClear(args: string[]) {
-  const slug = args.find((a) => !a.startsWith("--"));
+  const slug = await resolveSlug(args.find((a) => !a.startsWith("--")));
   if (!slug) return die("usage: drafty comments clear <slug> --yes");
   requireYes(args, `clearing all threads on ${slug}`);
   const r = await api("comments.clear", { body: { slug } });
@@ -1788,7 +1861,7 @@ async function commentsClear(args: string[]) {
 }
 
 async function canvasRm(args: string[]) {
-  const slug = args.find((a) => !a.startsWith("--"));
+  const slug = await resolveSlug(args.find((a) => !a.startsWith("--")));
   if (!slug) return die("usage: drafty canvas rm <slug> --yes");
   requireYes(args, `removing canvas ${slug}`);
   await api("canvas.rm", { body: { slug } });
@@ -1850,7 +1923,7 @@ async function canvasLs(args: string[] = []) {
 // Show one canvas's metadata — title, link, project, tags, mode, thread counts.
 // Composed from your `canvas ls` data (your own canvases only).
 async function canvasShow(args: string[]) {
-  const slug = args[0];
+  const slug = await resolveSlug(args[0]);
   if (!slug || slug.startsWith("--")) return die("usage: drafty canvas show <slug>");
   const r = await api("canvas.ls", { method: "GET" });
   const d = (r.items as any[]).find((x) => x.slug === slug);
@@ -2456,6 +2529,7 @@ LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
   drafty link create <slug|/path> [--code C] [--source S] [--medium M] [--campaign C] [--content C]   mint (or reuse) a shortlink
   drafty link ls [--json]                     your shortlinks, newest first
   drafty link rm <code>                       remove a shortlink
+  drafty resolve <link> [--json]              print the canvas behind any drafty link (slug, /canvas/ URL, or /l/ short link)
 
   drafty shot <slug|file.html|url> [--width N] [--revision R] [--annotation A] [--full] [-o out]   render to an image and print its path (the agent's eyes)
   drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b…] [--slug S] [--refresh] [--dry-run]   site board: map → curate → shoot → annotatable canvas
@@ -2466,6 +2540,9 @@ LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
   drafty whoami                               show your identity
   drafty setup                                register the skill + launcher, then run doctor
   drafty doctor                               preflight: runtime, state dir, skill, server, identity
+
+Any <slug> above also accepts a full ${BASE_URL}/canvas/<slug> URL or a
+${BASE_URL}/l/<code> short link — paste what you have, no need to extract the slug.
 
 Identity starts as a guest token (stored in ~/.drafty); \`drafty login\` upgrades
 it into a real account in place. Point at another server with DRAFTY_BASE_URL.
@@ -2488,11 +2565,11 @@ const COMMENTS: Record<string, Cmd> = {
   rm: commentsRm, "rm-reply": commentsRmReply, clear: commentsClear,
 };
 const MARKS: Record<string, Cmd> = { ls: marksLs, rm: marksRm };
-const LINK: Record<string, Cmd> = { create: linkCreate, ls: linkLs, rm: linkRm };
+const LINK: Record<string, Cmd> = { create: linkCreate, ls: linkLs, rm: linkRm, resolve: resolveCmd };
 // Top-level: session / meta — not scoped to a canvas or a comment.
 // `sweep` (released ≤0.25.0) folded into `tidy --sweep`; the alias keeps old
 // muscle memory working but help/skill document only tidy.
-const TOP: Record<string, Cmd> = { context, changelog, login, logout, whoami, setup, doctor, shot, tidy, audit: tidy, sweep: (a) => tidy([...a, "--sweep"]), present };
+const TOP: Record<string, Cmd> = { context, changelog, login, logout, whoami, setup, doctor, shot, tidy, audit: tidy, sweep: (a) => tidy([...a, "--sweep"]), present, resolve: resolveCmd };
 
 function runGroup(name: string, table: Record<string, Cmd>, args: string[]) {
   const [verb, ...rest] = args;
