@@ -413,16 +413,18 @@ async function api(op: string, opts: ApiOpts = {}): Promise<any> {
 }
 
 // ── asset pass ───────────────────────────────────────────────────────────────
-// On push, local image refs (<img src="./x.png">, url(./x.png)) are uploaded to
-// drafty's object store and rewritten to served URLs in the *published* content.
-// The on-disk file is left untouched, so it stays small and Read/Edit-able for
-// the agent instead of bloating with base64. Remote/data:/already-hosted refs
-// are left alone. The bytes go to /get/api/asset — the CLI never holds the store
-// token (consistent with every other op).
-const ASSET_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "avif"]);
+// On push, local media refs (<img src>, <video>/<source src>, poster=, url(...))
+// are uploaded to drafty's object store and rewritten to served URLs in the
+// *published* content. The on-disk file is left untouched, so it stays small and
+// Read/Edit-able for the agent instead of bloating with base64. Remote/data:/
+// already-hosted refs are left alone. Bytes go straight to Blob via a presigned
+// PUT URL the server mints (/get/api/asset-presign) — the CLI never holds the
+// store token, and nothing (video included) is proxied through a function.
+const ASSET_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "mp4", "webm", "mov"]);
 const ASSET_CONTENT_TYPE: Record<string, string> = {
   png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
   webp: "image/webp", svg: "image/svg+xml", avif: "image/avif",
+  mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime",
 };
 
 function refExt(ref: string): string {
@@ -439,23 +441,43 @@ function isLocalAssetRef(ref: string): boolean {
 
 async function uploadAssetBytes(bytes: Uint8Array, ext: string): Promise<string> {
   const token = await getToken();
-  const res = await fetch(`${BASE_URL}/get/api/asset?ext=${encodeURIComponent(ext)}`, {
+  const sha = createHash("sha256").update(bytes).digest("hex");
+  const ct = ASSET_CONTENT_TYPE[ext] || "application/octet-stream";
+  // 1) Ask the server where to put these bytes. It content-addresses by sha, so a
+  //    re-push of unchanged media is a dedup hit (no upload); otherwise it mints a
+  //    presigned PUT URL scoped to this exact pathname + content-type + size cap.
+  const res = await fetch(`${BASE_URL}/get/api/asset-presign`, {
     method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": ASSET_CONTENT_TYPE[ext] || "application/octet-stream" },
-    body: bytes,
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ sha, ext, size: bytes.byteLength }),
   });
   const data: any = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) die(data.error || `asset upload failed (${res.status})`);
-  return data.url as string;
+  if (!res.ok || data.ok === false) die(data.error || `asset presign failed (${res.status})`);
+  if (data.dedup) return data.url as string;
+  // 2) Upload straight to Blob via the opaque presigned URL — just a dumb PUT with
+  //    the content-type the token was signed for. No infra creds, no SDK.
+  const put = await fetch(data.uploadUrl as string, {
+    method: "PUT",
+    headers: { "content-type": ct },
+    body: bytes,
+  });
+  if (!put.ok) die(`asset upload failed (${put.status} ${put.statusText})`);
+  const putData: any = await put.json().catch(() => ({}));
+  return (putData.url as string) || (data.publicUrl as string);
 }
 
-// Upload every local image ref once, then rewrite only within matched <img src>
-// / url(...) contexts so a filename can't accidentally match elsewhere.
+// Upload every local media ref once, then rewrite only within matched src=/poster=
+// / url(...) contexts so a filename can't accidentally match elsewhere. The src
+// regex spans <img>, <video>, and <source> (a <video>'s <source src>); poster=
+// covers a <video> thumbnail.
+const MEDIA_SRC_RE = /<(?:img|video|source)\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi;
+const POSTER_RE = /\bposter\s*=\s*["']([^"']+)["']/gi;
+const CSS_URL_RE = /url\(\s*["']?([^"')]+?)["']?\s*\)/gi;
+
 async function uploadLocalAssets(content: string, file: string): Promise<string> {
-  const imgRe = /<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi;
-  const cssRe = /url\(\s*["']?([^"')]+?)["']?\s*\)/gi;
   const refs = new Set<string>();
-  for (const re of [imgRe, cssRe]) {
+  for (const re of [MEDIA_SRC_RE, POSTER_RE, CSS_URL_RE]) {
+    re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(content))) if (isLocalAssetRef(m[1].trim())) refs.add(m[1].trim());
   }
@@ -476,8 +498,9 @@ async function uploadLocalAssets(content: string, file: string): Promise<string>
   const rewrite = (full: string, ref: string) =>
     map.has(ref.trim()) ? full.replace(ref, map.get(ref.trim())!) : full;
   return content
-    .replace(/<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi, rewrite)
-    .replace(/url\(\s*["']?([^"')]+?)["']?\s*\)/gi, rewrite);
+    .replace(MEDIA_SRC_RE, rewrite)
+    .replace(POSTER_RE, rewrite)
+    .replace(CSS_URL_RE, rewrite);
 }
 
 // ── local↔canvas manifest (agent-eyes S1) ───────────────────────────────────
