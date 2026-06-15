@@ -2,7 +2,7 @@
   <img src="assets/hero.png" alt="Drafty — share a Claude artifact as a link. Anyone opens it, points at a line, drops a comment. Claude ships the edit." width="1100" />
 </p>
 
-**Drafty** is point-and-comment review for the things Claude makes. Claude writes a plan, a spec, a page — you publish it to a link, then click any element and leave a note, Figma-style. Claude reads the comments and ships a new version on the same link, with history. No screenshots, no re-pasting "the third paragraph, the one about pricing."
+**[Drafty](https://drafty.im)** is point-and-comment review for the things Claude makes. Claude writes a plan, a spec, a page — you publish it to a link, then click any element and leave a note, Figma-style. Claude reads the comments and ships a new version on the same link, with history. No screenshots, no re-pasting "the third paragraph, the one about pricing."
 
 ```
 /plugin marketplace add drafty-im/drafty
