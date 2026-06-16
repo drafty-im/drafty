@@ -213,6 +213,15 @@ function multiFlag(args: string[], name: string): string[] {
 }
 const url = (slug: string) => `${BASE_URL}/canvas/${slug}`;
 const shortTime = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+// Parse a human duration → ms: "20m", "90s", "1h", "500ms", or a bare number (= seconds).
+// null if unparseable. Lets long-running commands self-bound without an external
+// `timeout` (which macOS doesn't ship — the classic agent "command not found: timeout").
+function parseDurationMs(s: string): number | null {
+  const m = s.trim().match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/i);
+  if (!m) return null;
+  const mult = { ms: 1, s: 1000, m: 60000, h: 3600000 }[(m[2] || "s").toLowerCase()] ?? 1000;
+  return Math.round(Number(m[1]) * mult);
+}
 // Compact "time since" for listings — "just now" / "3h ago" / "5d ago".
 function relTime(ts: number): string {
   if (!ts) return "";
@@ -473,6 +482,11 @@ async function uploadAssetBytes(bytes: Uint8Array, ext: string): Promise<string>
 const MEDIA_SRC_RE = /<(?:img|video|source)\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi;
 const POSTER_RE = /\bposter\s*=\s*["']([^"']+)["']/gi;
 const CSS_URL_RE = /url\(\s*["']?([^"')]+?)["']?\s*\)/gi;
+// Markdown image syntax: ![alt](url), ![alt](<url>), ![alt](url "title"). The three
+// capture groups isolate the URL (g2) from its surrounding `![alt](` + optional `<`
+// (g1) and the trailing `>`/title/`)` (g3) so only the URL is rewritten — the alt
+// text is never touched even if it repeats the filename.
+const MD_IMAGE_RE = /(!\[[^\]]*\]\(\s*<?)([^)>\s"']+)(>?[^)]*\))/g;
 
 async function uploadLocalAssets(content: string, file: string): Promise<string> {
   const refs = new Set<string>();
@@ -481,6 +495,9 @@ async function uploadLocalAssets(content: string, file: string): Promise<string>
     let m: RegExpExecArray | null;
     while ((m = re.exec(content))) if (isLocalAssetRef(m[1].trim())) refs.add(m[1].trim());
   }
+  MD_IMAGE_RE.lastIndex = 0;
+  let mdMatch: RegExpExecArray | null;
+  while ((mdMatch = MD_IMAGE_RE.exec(content))) if (isLocalAssetRef(mdMatch[2].trim())) refs.add(mdMatch[2].trim());
   if (!refs.size) return content;
 
   const dir = dirname(resolve(file));
@@ -500,7 +517,9 @@ async function uploadLocalAssets(content: string, file: string): Promise<string>
   return content
     .replace(MEDIA_SRC_RE, rewrite)
     .replace(POSTER_RE, rewrite)
-    .replace(CSS_URL_RE, rewrite);
+    .replace(CSS_URL_RE, rewrite)
+    .replace(MD_IMAGE_RE, (full, pre, ref, post) =>
+      map.has(ref.trim()) ? `${pre}${map.get(ref.trim())}${post}` : full);
 }
 
 // ── local↔canvas manifest (agent-eyes S1) ───────────────────────────────────
@@ -1781,13 +1800,30 @@ async function commentsInbox(args: string[]) {
 
 async function commentsWatch(args: string[]) {
   const slug = await resolveSlug(args[0]);
-  if (!slug) return die("usage: drafty comments watch <slug> [--json] [--backlog]");
+  if (!slug) return die("usage: drafty comments watch <slug> [--json] [--backlog] [--for DURATION]");
   const asJson = has(args, "json");
   const token = await getToken();
-  if (!asJson) console.error(`👀 watching ${url(slug)} — new comments will appear here\n`);
+
+  // --for/--timeout: self-bound the stream so callers (esp. agents) never need an
+  // external `timeout`. On the deadline we exit 0 cleanly — a bounded watch is a
+  // success, not a failure (the old "wrap it in `timeout`" path died with 127 on
+  // macOS, which has no `timeout`). The SSE loop keeps the process alive, so the
+  // timer reliably fires; unref'd so it can never itself hold exit open.
+  const forRaw = flag(args, "for") ?? flag(args, "timeout");
+  if (forRaw !== undefined) {
+    const ms = parseDurationMs(forRaw);
+    if (ms === null || ms <= 0) return die(`--for: couldn't read duration "${forRaw}" — try 20m, 90s, 1h, or a plain number of seconds`);
+    const t = setTimeout(() => {
+      if (!asJson) console.error(`\n⏲ watch window (${forRaw}) elapsed — exiting cleanly. Re-run to keep listening.`);
+      process.exit(0);
+    }, ms);
+    if (typeof t.unref === "function") t.unref();
+    if (!asJson) console.error(`   (auto-exits after ${forRaw} — no external \`timeout\` needed)`);
+  }
 
   let stop = false;
   process.on("SIGINT", () => { stop = true; process.exit(0); });
+  if (!asJson) console.error(`👀 watching ${url(slug)} — new comments will appear here\n`);
 
   const emit = (ev: any) => {
     if (asJson) {
@@ -2591,7 +2627,7 @@ CANVAS — the canvas you publish
 COMMENTS — threads pinned to a canvas, and their replies
   drafty comments ls <slug> [--json] [--open]   threads + replies on a canvas
   drafty comments inbox [slug] [--json] [--all]   fresh threads that need Claude
-  drafty comments watch <slug> [--json] [--backlog]   stream new comments live (SSE doorbell)
+  drafty comments watch <slug> [--json] [--backlog] [--for DUR]   stream new comments live (SSE doorbell); --for 20m self-exits, no external timeout needed
   drafty comments reply <annotationId> "<message>"   reply in a thread as Claude
   drafty comments working <annotationId>      shimmer the thread while you work on it
   drafty comments resolve <annotationId> / reopen <annotationId>   toggle a thread's done state
