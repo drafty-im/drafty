@@ -18,7 +18,10 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
 
 const BASE_URL = process.env.DRAFTY_BASE_URL || "https://drafty.im";
-const STATE_DIR = join(homedir(), ".drafty");
+// Login/token/manifest state lives in ~/.drafty by default. DRAFTY_STATE_DIR
+// overrides it so a sandboxed run (an e2e harness, or an agent under test) keeps
+// its login fully separate from the real ~/.drafty — same spirit as DRAFTY_BASE_URL.
+const STATE_DIR = process.env.DRAFTY_STATE_DIR || join(homedir(), ".drafty");
 const TOKEN_FILE = join(STATE_DIR, "token");
 // A durable marker of the last signed-in identity, kept alongside the token.
 // If the token ever goes missing while this says we were signed in, we make the
