@@ -2350,11 +2350,32 @@ async function canvasClaim(args: string[]) {
 // this CLI. Local-only by design: the browser must reach 127.0.0.1 on this
 // machine. After sign-in we fold any canvases the prior guest made into the new
 // account.
-async function login() {
+async function login(args: string[] = []) {
+  const ti = args.indexOf("--token");
+  const connectCode = ti >= 0 ? args[ti + 1] : undefined;
+
   const oldToken = existsSync(TOKEN_FILE) ? readFileSync(TOKEN_FILE, "utf8").trim() : "";
   let oldGuestId = "";
   if (oldToken) {
     try { const me = await api("whoami", { method: "GET", token: oldToken }); if (me.isGuest) oldGuestId = me.userId; } catch { /* ignore */ }
+  }
+
+  // Non-interactive sign-in: trade a one-time connect code (from the web
+  // /connect page) for the account's session — no browser, no loopback. Used by
+  // the agent in the post-signup "connect your agent" flow.
+  if (connectCode) {
+    await track("auth.started", { method: "token" });
+    let token: string;
+    try {
+      const r = await fetch(`${BASE_URL}/get/api/connect.exchange`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: connectCode }) });
+      const d = (await r.json().catch(() => ({}))) as { ok?: boolean; error?: string; refreshToken?: string };
+      if (!r.ok || d.ok === false || !d.refreshToken) throw new Error(d.error || "the connect code was rejected");
+      token = d.refreshToken;
+    } catch (e) { return die((e as Error).message); }
+    writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+    await track("auth.completed", { method: "token" });
+    await finishSignIn(token, oldToken, oldGuestId);
+    return;
   }
 
   const state = crypto.randomUUID();
@@ -2414,9 +2435,14 @@ async function login() {
   // Valid token in hand — store it first so login can't fail past this point.
   writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
   await track("auth.completed", { method: "browser" });
+  await finishSignIn(token, oldToken, oldGuestId);
+}
 
-  // Best-effort: identify (for the confirmation line) and fold guest canvases in.
-  // Raw fetches, never `api()` — a hiccup here must not undo a successful sign-in.
+// Best-effort post-sign-in: identify (for the confirmation line) and fold the
+// old guest's canvases into the account. Raw fetches, never `api()` — a hiccup
+// here must not undo a sign-in that already stored the token. Shared by the
+// loopback (`login`) and non-interactive (`login --token`) paths.
+async function finishSignIn(token: string, oldToken: string, oldGuestId: string) {
   let label = "";
   try {
     const meRes = await fetch(`${BASE_URL}/get/api/whoami`, { headers: { authorization: `Bearer ${token}` } });
