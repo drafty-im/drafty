@@ -2,7 +2,7 @@
   <img src="assets/hero.png" alt="Drafty — the review layer for AI-drafted work. Share it as a link, point at any line, drop a comment, and your agent ships the next version." width="1100" />
 </p>
 
-**[Drafty](https://drafty.im)** is point-and-comment review for the things Claude makes. Claude writes a plan, a spec, a page — you publish it to a link, then click any element and leave a note, Figma-style. Claude reads the comments and ships a new version on the same link, with history. No screenshots, no re-pasting "the third paragraph, the one about pricing."
+**[Drafty](https://drafty.im)** is the review layer for AI-drafted work. Your agent writes a plan, a spec, a page — you share it as a link, then click any element and leave a note, Figma-style. Every comment becomes your agent's next edit, on the same link, with history. No screenshots, no re-pasting "the third paragraph, the one about pricing." This repo is the **Claude Code plugin** that runs the loop end to end.
 
 ```
 /plugin marketplace add drafty-im/drafty

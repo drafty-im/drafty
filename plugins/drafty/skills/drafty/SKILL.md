@@ -3,7 +3,7 @@ name: drafty
 description: Share a Markdown/HTML canvas (a plan, draft, design, page) to drafty.im/canvas/<slug> where the user and anyone they invite can drop Figma-style threaded comments anchored to specific elements. Read that feedback, reply on the canvas or in chat, mark items done, and push an updated version. Use when the user says "drafty it", "drafty this", "drafty that", "drafty <file>", "share this for feedback", "put this on a canvas", "send this to the canvas", "what did they comment", "read the canvas comments", "address the feedback", "update the canvas", or pastes a drafty.im/canvas/ URL. Also covers auth — "drafty login", "drafty auth", "drafty signup", "sign in to drafty", "sign up", "authenticate", or "claim my canvases" all map to the drafty login command. And "update drafty", "upgrade drafty", or "is drafty up to date" map to updating the plugin (claude plugin update drafty@drafty-im, then ask the user to run /reload-plugins).
 ---
 
-# Drafty — comment on Claude artifacts, Claude edits them
+# Drafty — the review layer for AI-drafted work
 
 A canvas is a published artifact that people annotate like Figma comments: hover any
 element, click to attach a threaded comment, mark threads complete. You (Claude)
