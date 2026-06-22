@@ -736,6 +736,50 @@ async function commentsStatus(args: string[], status: "open" | "completed") {
   await track(status === "completed" ? "thread.resolved" : "thread.reopened", { annotationId: annId, by: "agent" });
 }
 
+// Author a NEW thread on a canvas, as Claude — the create counterpart to reply.
+// `--anchor "<text>"` pins it to the element whose text best matches (the server
+// resolves by fuzzy match and hard-errors below a confidence floor, so a weak
+// match never lands silently on the wrong element); `--at <fx>,<fy>` adds a point
+// inside that element (0..1 — for pinning on a screenshot in a present board);
+// `--canvas` makes it a canvas-level note with no anchor. Lets `present` stay a
+// pure capture tool while analysis layers on as anchored comments that survive a
+// --refresh (annotations are separate data, re-anchored on every re-push).
+async function commentsCreate(args: string[]) {
+  const VALUE_FLAGS = new Set(["anchor", "at"]);
+  const positionals: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const t = args[i];
+    if (t.startsWith("--")) { if (VALUE_FLAGS.has(t.slice(2))) i++; continue; }
+    positionals.push(t);
+  }
+  const slug = await resolveSlug(positionals[0]);
+  const body = positionals.slice(1).join(" ").trim();
+  const anchor = flag(args, "anchor");
+  const canvas = has(args, "canvas");
+  const at = flag(args, "at");
+  const usage = 'usage: drafty comments create <slug> --anchor "<element text>" [--at <fx>,<fy>] "<message>"   (or --canvas for an unanchored note)';
+  if (!slug || slug.startsWith("--") || !body) return die(usage);
+  if (!canvas && !anchor) return die(`${usage}\n  pass --anchor "<text>" to pin to an element, or --canvas for a canvas-level note`);
+  let fx: number | undefined, fy: number | undefined;
+  if (at !== undefined) {
+    const [a, b] = at.split(",").map((s) => Number(s.trim()));
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a < 0 || a > 1 || b < 0 || b > 1) return die("--at expects <fx>,<fy> as fractions 0..1 (e.g. --at 0.78,0.22)");
+    if (canvas) return die("--at is a point inside an anchored element; it can't combine with --canvas");
+    fx = a; fy = b;
+  }
+  const r = await api("comments.create", { body: { slug, body, ...(canvas ? { canvas: true } : { anchor }), ...(fx !== undefined ? { fx, fy } : {}) } });
+  console.log(`✓ comment created on ${url(slug)}`);
+  if (r.canvasLevel) console.log(`  canvas-level note (no anchor)`);
+  else {
+    const score = typeof r.matchScore === "number" && r.matchScore < 1 ? ` · ${Math.round(r.matchScore * 100)}% match` : "";
+    const at2 = fx !== undefined ? ` @ (${Math.round(fx * 100)}%,${Math.round(fy! * 100)}%)` : "";
+    const txt = r.anchorText ? ` "${String(r.anchorText).slice(0, 50)}"` : "";
+    console.log(`  anchored to <${r.anchorTag}>${txt}${at2}${score}`);
+  }
+  console.log(`  thread ${r.annotationId} — reply: drafty comments reply ${r.annotationId} "..."   resolve: drafty comments resolve ${r.annotationId}`);
+  await track("agent.comment_created", { slug, annotationId: r.annotationId, canvasLevel: !!r.canvasLevel });
+}
+
 async function canvasRestore(args: string[]) {
   const [rawSlug, revisionId] = args;
   const slug = await resolveSlug(rawSlug);
@@ -2657,6 +2701,7 @@ COMMENTS — threads pinned to a canvas, and their replies
   drafty comments ls <slug> [--json] [--open]   threads + replies on a canvas
   drafty comments inbox [slug] [--json] [--all]   fresh threads that need Claude
   drafty comments watch <slug> [--json] [--backlog] [--for DUR]   stream new comments live (SSE doorbell); --for 20m self-exits, no external timeout needed
+  drafty comments create <slug> --anchor "<text>" [--at fx,fy] "<msg>"   open a NEW thread as Claude (--canvas for an unanchored note)
   drafty comments reply <annotationId> "<message>"   reply in a thread as Claude
   drafty comments working <annotationId>      shimmer the thread while you work on it
   drafty comments resolve <annotationId> / reopen <annotationId>   toggle a thread's done state
@@ -2699,7 +2744,7 @@ const CANVAS: Record<string, Cmd> = {
   mode: canvasMode, visibility: canvasVisibility, rm: canvasRm, claim: canvasClaim,
 };
 const COMMENTS: Record<string, Cmd> = {
-  ls: commentsLs, inbox: commentsInbox, watch: commentsWatch, reply: commentsReply, working: commentsWorking,
+  ls: commentsLs, inbox: commentsInbox, watch: commentsWatch, create: commentsCreate, reply: commentsReply, working: commentsWorking,
   resolve: (a) => commentsStatus(a, "completed"), reopen: (a) => commentsStatus(a, "open"),
   rm: commentsRm, "rm-reply": commentsRmReply, clear: commentsClear,
 };

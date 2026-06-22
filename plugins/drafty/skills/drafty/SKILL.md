@@ -134,6 +134,7 @@ the update unprompted, since it changes their environment.
 | `drafty comments watch <slug> [--json] [--backlog]` | **Socket mode** — stream new human comments live to stdout. Run in background; surface comments to the user as they arrive. |
 | `drafty comments inbox [slug] [--json] [--all]` | **Fresh threads that need Claude** — open, not already being worked on, latest comment from a human. Loop-safe (resolved/answered threads never reappear). A no-slug sweep only surfaces canvases set to `live`; pass a `slug` or `--all` to include `feedback` canvases too. |
 | `drafty comments working <annotationId>` | Shimmer the thread on the canvas while you work on it. Stays on through replies; cleared by resolve/reopen (or after 10 min idle). |
+| `drafty comments create <slug> --anchor "<text>" [--at <fx>,<fy>] "<msg>"` | **Open a NEW thread as Claude** — the create counterpart to reply. `--anchor "<text>"` pins it to the element whose text best matches (server resolves by fuzzy/token match and **hard-errors on a weak OR ambiguous match**, so a vague query never lands on the wrong element — pass distinctive element text, enough to be unique); `--at <fx>,<fy>` adds a point inside it (0..1 — pin on a screenshot in a `present` board); `--canvas` makes it an unanchored canvas-level note. This is how Claude leaves a pointed first-pass review, or layers analysis onto a board — and it survives a board `--refresh` (annotations are separate data, re-anchored on re-push). |
 | `drafty comments reply <annotationId> "<msg>"` | Reply in a thread, authored as Claude (shows on the canvas). |
 | `drafty comments resolve <annotationId>` / `reopen <annotationId>` | Toggle a thread's completed state. |
 | `drafty canvas pull <slug> [--revision <id>] [-o <file>]` | Download the artifact body. Content goes to stdout (newline-terminated, so it pipes/redirects cleanly); metadata to stderr. `--revision` pulls a past version; `-o`/`--out` writes a file; `--json` returns the full envelope. |
@@ -438,6 +439,14 @@ canvas yet.
   `drafty shot <board-slug> --width 1280` (or open the canvas) and check the
   frames render real content (bot-walled sites can come back as challenge
   pages or blanks; re-run with `--urls` for the affected screens or say so).
+- **Layer your own analysis as comments, don't fork `present`.** `present` is a
+  pure capture tool — to turn a board into an inspiration / comparison / review
+  canvas, leave the verdict and pointed callouts with `drafty comments create`:
+  `--anchor "<screen label>" --at <fx>,<fy> "steal this hero"` pins on a specific
+  screenshot, `--canvas "overall verdict"` for a top-level note. These survive a
+  `--refresh` (separate data). For analysis that *is* the artifact (a side-by-side
+  comparison doc with its own layout), author HTML and `canvas push` it instead —
+  `push` uploads any local `shot` images you embed.
 - **The feedback loop on a board** is the point-anchor flow: humans tap a spot
   on a screenshot; your inbox carries the image, the point, and (in the board's
   meta line) the live URL — so you can also re-render the *current* page
