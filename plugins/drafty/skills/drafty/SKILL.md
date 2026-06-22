@@ -142,7 +142,7 @@ the update unprompted, since it changes their environment.
 | `drafty canvas revert <file\|slug> [--to <revisionId>]` | **The undo.** Atomically: restore the canvas (default: one revision back) AND rewrite the local file to match + update the manifest. Never hand-edit a file back to undo — a later push would re-introduce what the canvas reverted. |
 | `drafty canvas status <file>` | Sync report for a pushed file: `in-sync` / `local-ahead` (file edited since last push) / `canvas-ahead` (canvas moved — browser edit, restore, another agent) / `diverged` (both). Check before pushing when in doubt. |
 | `drafty shot <slug>\|<file.html>\|<url> [--width N] [--revision <id>] [--annotation <id>] [--full] [-o out]` | **Render to an image and print its path** — your eyes. A local file/URL renders via headless Chrome on this machine; a public canvas renders via the server (cached per revision×width); a private canvas auto-falls back to rendering pulled content locally. `--annotation <id>` reproduces a commenter's exact view (their width + revision, anchored element highlighted). Read the printed path to *see* it. |
-| `drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b…] [--slug S] [--refresh] [--dry-run]` | **Site board**: map a website (its own robots/sitemap/homepage — no crawling), curate up to 20 main screens, shoot each at desktop+phone width with local Chrome, and publish an annotatable board canvas. `--dry-run` previews the screen list; `--urls` overrides curation; `--slug <board> --refresh` re-shoots the same screens as a tick (self-refreshing board). |
+| `drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b…] [--notes <file>\|--note "…"] [--slug S] [--refresh] [--dry-run]` | **Site board**: map a website (its own robots/sitemap/homepage — no crawling), curate up to 20 main screens, shoot each at desktop+phone width with local Chrome, and publish an annotatable board canvas. `--dry-run` previews the screen list; `--urls` overrides curation; `--notes <file>` (or `--note "text"`) pins your own analysis/verdict atop the board (markdown or HTML, auto-detected) and it **survives `--refresh`**; `--slug <board> --refresh` re-shoots the same screens as a tick (self-refreshing board). |
 | `drafty context [--limit N] [--archived] [--json]` | **Orientation in one call** — identity, local git repo/branch, the projects + tags already in use (with counts), and the most-recent canvases (capped to ~15; `--limit 0` for all). Run it before a push/update to pick the project, reuse tags, and decide create-vs-update. |
 | `drafty canvas ls [--project P] [--tag T] [--unfiled] [--archived\|--all] [--json]` | The filtered / full list — **newest first**, the same order as the web home and `drafty context`, each row showing project · `#tags` · open-thread count. Orient with `drafty context` first; reach for `ls` to **drill in or filter**: `--project "<name>"`, `--tag <label>`, `--unfiled` (missing a project or tags), `--archived` (just the shelf), `--all` (active + archived). |
 | `drafty tidy [--project P] [--sweep] [--json]` | **One audit pass over the canvas list** (alias: `drafty audit`) — unfiled canvases (archived included), junk candidates (blank/untitled), tag drift (plural twins, one-off tags), and the **sweep**: active canvases that *look shipped* (slug referenced in a commit of the cwd repo after the canvas last changed) or *look stale* (idle 3+ weeks, no open threads), with commit evidence; pinned canvases are never sweep candidates. `--sweep` renders just that section (the ship-moment micro-sweep); `--project` scopes either form. Detection, not verdicts: you classify each finding (see **The tidy pass** below). |
@@ -434,6 +434,14 @@ canvas yet.
 - **Preview before shooting** when the site is unfamiliar: `--dry-run` prints
   the curated screen list; adjust with `--screens N` or hand-pick via
   `--urls a,b,c`, then run for real.
+- **Pin your own notes atop the board** with `--notes <file>` (markdown or HTML,
+  auto-detected; `-` reads stdin) or `--note "one-liner"`. This is how a board
+  becomes an *inspiration / comparison / review* canvas, not just raw screens —
+  write the verdict, what's good, what to steal, then let the shots back it up.
+  The notes ride in the board's meta, so a later `--refresh` re-shoots the
+  screens **and keeps the notes**. (Want screenshots of a *second* site inside
+  the notes? `present` that site first, then reference its uploaded image URLs in
+  your HTML notes.)
 - **Review the board before handing it over** — you have eyes; use them.
   `drafty shot <board-slug> --width 1280` (or open the canvas) and check the
   frames render real content (bot-walled sites can come back as challenge
