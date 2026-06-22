@@ -1323,49 +1323,13 @@ async function presentLabels(urls: string[]): Promise<string[]> {
 
 type PresentScreen = { url: string; label: string };
 
-// Tiny block-level Markdown → HTML for board notes (--notes/--note). No deps:
-// headings, hr, ordered/unordered lists, blockquotes, paragraphs, and inline
-// code/bold/italic/links. HTML in markdown mode is escaped (the board styles the
-// output); pass an .html notes file for verbatim markup. Deliberately small — it
-// renders an intro blurb, not a document.
-function mdToHtml(src: string): string {
-  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const inline = (s: string) =>
-    esc(s)
-      .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/(^|[^*])\*([^*\s][^*]*?)\*/g, "$1<em>$2</em>")
-      .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, t, u) => `<a href="${String(u).replace(/"/g, "&quot;")}" rel="noopener">${t}</a>`);
-  const out: string[] = [];
-  let para: string[] = [];
-  let list: { type: "ul" | "ol"; items: string[] } | null = null;
-  const flushPara = () => { if (para.length) { out.push(`<p>${inline(para.join(" "))}</p>`); para = []; } };
-  const flushList = () => { if (list) { out.push(`<${list.type}>${list.items.map((i) => `<li>${inline(i)}</li>`).join("")}</${list.type}>`); list = null; } };
-  for (const raw of src.replace(/\r\n/g, "\n").split("\n")) {
-    const line = raw.trim();
-    let m: RegExpMatchArray | null;
-    if (!line) { flushPara(); flushList(); continue; }
-    if (/^(-{3,}|\*{3,}|_{3,})$/.test(line)) { flushPara(); flushList(); out.push("<hr />"); continue; }
-    if ((m = line.match(/^(#{1,6})\s+(.+)$/))) { flushPara(); flushList(); const n = m[1].length; out.push(`<h${n}>${inline(m[2])}</h${n}>`); continue; }
-    if ((m = line.match(/^[-*+]\s+(.+)$/))) { flushPara(); if (!list || list.type !== "ul") { flushList(); list = { type: "ul", items: [] }; } list.items.push(m[1]); continue; }
-    if ((m = line.match(/^\d+[.)]\s+(.+)$/))) { flushPara(); if (!list || list.type !== "ol") { flushList(); list = { type: "ol", items: [] }; } list.items.push(m[1]); continue; }
-    if ((m = line.match(/^>\s?(.*)$/))) { flushPara(); flushList(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); continue; }
-    para.push(line);
-  }
-  flushPara(); flushList();
-  return out.join("\n");
-}
-type PresentNotes = { html: string; src: string; format: "markdown" | "html" };
-
 // The board: self-contained HTML, point-anchor friendly (one plain <img> per
 // shot), timestamp prominent, live URL quiet. The JSON meta block is what makes
 // refresh deterministic — a re-run with --slug reads it back instead of
 // re-discovering.
-function presentBoardHtml(root: URL, screens: PresentScreen[], widths: number[], stamp: string, shotFile: (i: number, w: number) => string, dupNote: (i: number) => string | undefined = () => undefined, notes?: PresentNotes): string {
+function presentBoardHtml(root: URL, screens: PresentScreen[], widths: number[], stamp: string, shotFile: (i: number, w: number) => string, dupNote: (i: number) => string | undefined = () => undefined): string {
   const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
-  // Notes raw source + format ride in the meta so a later --refresh re-emits them
-  // (re-rendered fresh) instead of dropping them when it re-shoots from meta.
-  const meta = JSON.stringify({ kind: "drafty-present", root: root.href, widths, screens, ...(notes ? { notes: notes.src, notesFormat: notes.format } : {}) }, null, 1);
+  const meta = JSON.stringify({ kind: "drafty-present", root: root.href, widths, screens }, null, 1);
   const sections = screens
     .map((sc, i) => {
       const path = new URL(sc.url).pathname || "/";
@@ -1405,17 +1369,6 @@ function presentBoardHtml(root: URL, screens: PresentScreen[], widths: number[],
   h1 { font-size: 26px; letter-spacing: -0.02em; margin: 0 0 4px; }
   .sub { color: var(--muted); font-size: 14px; margin: 0 0 26px; }
   .sub a { color: inherit; }
-  .notes { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
-           padding: 4px 22px 8px; margin: 0 0 26px; }
-  .notes > :first-child { margin-top: 16px; }
-  .notes h1 { font-size: 22px; } .notes h2 { font-size: 18px; margin-top: 22px; }
-  .notes h3 { font-size: 15px; margin-top: 18px; }
-  .notes p, .notes li { font-size: 14.5px; }
-  .notes a { color: inherit; }
-  .notes code { font-family: ui-monospace, monospace; font-size: 0.9em;
-                background: color-mix(in srgb, var(--ink) 8%, transparent); padding: 1px 5px; border-radius: 5px; }
-  .notes hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
-  .notes blockquote { margin: 12px 0; padding: 2px 0 2px 14px; border-left: 3px solid var(--line); color: var(--muted); }
   .screen { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
             padding: 18px 20px; margin: 0 0 18px; }
   h2 { font-size: 17px; margin: 0 0 2px; }
@@ -1432,7 +1385,7 @@ function presentBoardHtml(root: URL, screens: PresentScreen[], widths: number[],
 <main>
   <h1>${esc(root.host)} — site board</h1>
   <p class="sub">captured ${stamp} · ${screens.length} screen${screens.length === 1 ? "" : "s"} · <a href="${esc(root.href)}" rel="noopener">${esc(root.host)}</a></p>
-${notes ? `  <section class="notes">${notes.html}</section>\n` : ""}${sections}
+${sections}
 </main>
 <script type="application/json" id="drafty-present-meta">${meta}</script>
 </body>
@@ -1442,28 +1395,13 @@ ${notes ? `  <section class="notes">${notes.html}</section>\n` : ""}${sections}
 
 async function present(args: string[]) {
   const usage =
-    "usage: drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b,c] [--notes <file>] [--note \"text\"] [--slug S] [--title T] [--visibility public|authed|invite] [--refresh] [--project P] [--tag T …] [--dry-run]";
+    "usage: drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b,c] [--slug S] [--title T] [--visibility public|authed|invite] [--refresh] [--project P] [--tag T …] [--dry-run]";
   const slugFlag = flag(args, "slug");
   const refresh = has(args, "refresh");
   const dry = has(args, "dry-run");
   const cap = Math.max(1, Math.min(40, Number(flag(args, "screens") ?? 20)));
   let widths = (flag(args, "widths") ?? "1280,390").split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
   if (!widths.length) widths = [1280, 390];
-
-  // Author notes pinned atop the board (analysis, a comparison verdict, context).
-  // `--note "…"` is inline markdown; `--notes <file>` reads a file (`-` = stdin),
-  // markdown or HTML auto-detected. Either is stashed in the board meta so a later
-  // --refresh keeps it. Flags win; otherwise an existing board's notes are reused.
-  let notesSrc: string | undefined;
-  let notesFormat: "markdown" | "html" = "markdown";
-  const noteInline = flag(args, "note");
-  const notesFile = flag(args, "notes");
-  if (noteInline !== undefined) { notesSrc = noteInline; notesFormat = "markdown"; }
-  else if (notesFile !== undefined) {
-    const txt = notesFile === "-" ? readFileSync(0, "utf8") : readFileSync(resolve(notesFile), "utf8");
-    notesSrc = txt;
-    notesFormat = inferFormat(notesFile === "-" ? "notes.md" : notesFile, txt);
-  }
 
   let rootStr = args[0] && !args[0].startsWith("--") ? args[0] : undefined;
   let screens: PresentScreen[] | null = null;
@@ -1482,7 +1420,6 @@ async function present(args: string[]) {
           screens = meta.screens;
           rootStr = rootStr ?? meta.root;
           if (!flag(args, "widths") && Array.isArray(meta.widths) && meta.widths.length) widths = meta.widths;
-          if (notesSrc === undefined && typeof meta.notes === "string") { notesSrc = meta.notes; notesFormat = meta.notesFormat === "html" ? "html" : "markdown"; }
           console.error(`  ↻ re-shooting ${screens!.length} screens from the board's meta`);
         }
       }
@@ -1514,17 +1451,11 @@ async function present(args: string[]) {
     }));
   }
 
-  const notes: PresentNotes | undefined = notesSrc === undefined
-    ? undefined
-    : { src: notesSrc, format: notesFormat, html: notesFormat === "html" ? notesSrc : mdToHtml(notesSrc) };
-
   if (dry) {
     console.log(`# ${root.host} — ${screens.length} screen(s), widths ${widths.join("/")}`);
     screens.forEach((s, i) => console.log(`${String(i + 1).padStart(2)}. ${s.label}\n    ${s.url}`));
-    if (notes) console.log(`\n# notes attached (${notes.format}, ${notes.src.length} chars)`);
     return;
   }
-  if (notes) console.error(`  ✎ notes attached (${notes.format})`);
 
   // Shoot every screen at every width (local Chrome — zero credits).
   const work = join(tmpdir(), `drafty-present-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
@@ -1581,7 +1512,7 @@ async function present(args: string[]) {
   }
 
   const stamp = new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC";
-  const html = presentBoardHtml(root, screens, widths, stamp, shotFile, (i) => dupNotes.get(i), notes);
+  const html = presentBoardHtml(root, screens, widths, stamp, shotFile, (i) => dupNotes.get(i));
   const boardFile = join(work, "board.html");
   writeFileSync(boardFile, html);
 
@@ -2740,7 +2671,7 @@ LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
   drafty resolve <link> [--json]              print the canvas behind any drafty link (slug, /canvas/ URL, or /l/ short link)
 
   drafty shot <slug|file.html|url> [--width N] [--revision R] [--annotation A] [--full] [-o out]   render to an image and print its path (the agent's eyes)
-  drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b…] [--notes <file>|--note "…"] [--slug S] [--refresh] [--dry-run]   site board: map → curate → shoot → annotatable canvas (notes pin atop, survive --refresh)
+  drafty present <url> [--screens N] [--widths 1280,390] [--urls a,b…] [--slug S] [--refresh] [--dry-run]   site board: map → curate → shoot → annotatable canvas
   drafty context [--limit N] [--archived] [--json]   one-shot orientation: identity, git, projects, tags + recent canvases
   drafty tidy [--project P] [--sweep] [--json]   one audit pass: unfiled canvases, junk titles, tag drift + which look shipped/stale (commit evidence); --sweep = just the shipped/stale section
   drafty changelog [--json]                   what shipped, by week
