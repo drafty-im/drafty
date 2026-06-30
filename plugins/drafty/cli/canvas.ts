@@ -1606,12 +1606,18 @@ async function canvasPull(args: string[]) {
   const outIdx = args.indexOf("-o");
   const out = flag(args, "out") || (outIdx >= 0 ? args[outIdx + 1] : undefined);
   const r = await api("canvas.pull", { method: "GET", query: { slug, ...(revisionId ? { revisionId } : {}) } });
+  // `state` is the canvas's owner-private window.drafty.persist data, folded into
+  // every pull by the server so an agent reading a canvas always sees it without
+  // a separate fetch — empty/absent for canvases that never called persist.set.
+  const state = (r.state as Record<string, unknown> | undefined) || {};
+  const hasState = Object.keys(state).length > 0;
   if (has(args, "json")) {
-    console.log(JSON.stringify({ slug, title: r.title, format: r.format, revisionId: r.revisionId, createdAt: r.createdAt, content: r.content }, null, 2));
+    console.log(JSON.stringify({ slug, title: r.title, format: r.format, revisionId: r.revisionId, createdAt: r.createdAt, content: r.content, state }, null, 2));
   } else {
     const ver = r.revisionId ? `revision ${r.revisionId}` : "current";
     console.error(`# ${r.title} — ${url(slug)}`);
     console.error(`  ${r.format} · ${ver}${r.createdAt ? ` · ${new Date(r.createdAt).toLocaleString()}` : ""}`);
+    if (hasState) console.error(`  persisted state: ${JSON.stringify(state)}`);
     if (out) {
       writeFileSync(out, r.content);
       console.error(`✓ wrote ${out}`);
