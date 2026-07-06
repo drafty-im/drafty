@@ -1826,17 +1826,17 @@ async function commentsInbox(args: string[]) {
   }
 }
 
-async function commentsWatch(args: string[]) {
-  const slug = await resolveSlug(args[0]);
-  if (!slug) return die("usage: drafty comments watch <slug> [--json] [--backlog] [--for DURATION]");
-  const asJson = has(args, "json");
+// Shared SSE doorbell loop for `comments watch` and `inbox watch`: --for
+// self-bounding, SIGINT, and reconnect-with-backoff around the single
+// /get/api/comments.watch stream; the caller picks which events it prints.
+//
+// --for/--timeout: self-bound the stream so callers (esp. agents) never need an
+// external `timeout`. On the deadline we exit 0 cleanly — a bounded watch is a
+// success, not a failure (the old "wrap it in `timeout`" path died with 127 on
+// macOS, which has no `timeout`). The SSE loop keeps the process alive, so the
+// timer reliably fires; unref'd so it can never itself hold exit open.
+async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (ev: any) => void) {
   const token = await getToken();
-
-  // --for/--timeout: self-bound the stream so callers (esp. agents) never need an
-  // external `timeout`. On the deadline we exit 0 cleanly — a bounded watch is a
-  // success, not a failure (the old "wrap it in `timeout`" path died with 127 on
-  // macOS, which has no `timeout`). The SSE loop keeps the process alive, so the
-  // timer reliably fires; unref'd so it can never itself hold exit open.
   const forRaw = flag(args, "for") ?? flag(args, "timeout");
   if (forRaw !== undefined) {
     const ms = parseDurationMs(forRaw);
@@ -1851,24 +1851,13 @@ async function commentsWatch(args: string[]) {
 
   let stop = false;
   process.on("SIGINT", () => { stop = true; process.exit(0); });
-  if (!asJson) console.error(`👀 watching ${url(slug)} — new comments will appear here\n`);
-
-  const emit = (ev: any) => {
-    if (asJson) {
-      console.log(JSON.stringify({ annotationId: ev.annotationId, anchorTag: ev.anchorTag, anchorText: ev.anchorText, anchors: ev.anchors ?? null, anchorFx: ev.anchorFx ?? null, anchorFy: ev.anchorFy ?? null, status: ev.status, author: ev.author, body: ev.body, createdAt: ev.createdAt }));
-    } else {
-      console.log(`[${shortTime(ev.createdAt)}] ${ev.author} on ${anchorLabel(ev)}`);
-      console.log(`  ${ev.body}`);
-      console.log(`  ↳ reply: drafty comments reply ${ev.annotationId} "..."   resolve: drafty comments resolve ${ev.annotationId}\n`);
-    }
-  };
 
   // SSE connections don't live forever — a serverless host (Vercel) caps a
   // function's duration, so the stream WILL drop periodically. Reconnect so the
-  // doorbell stays armed for the whole session. Comments that land during the
-  // brief reconnect gap are caught by the next `inbox` reconcile (the doorbell
+  // doorbell stays armed for the whole session. Events that land during the
+  // brief reconnect gap are caught by the next inbox reconcile (the doorbell
   // wakes you; inbox is the source of truth). Only the first connect honours
-  // --backlog; reconnects start fresh so old comments aren't replayed.
+  // --backlog; reconnects start fresh so old events aren't replayed.
   let attempt = 0;
   while (!stop) {
     const qs = new URLSearchParams({ slug, ...(has(args, "backlog") && attempt === 0 ? { backlog: "1" } : {}) });
@@ -1896,7 +1885,7 @@ async function commentsWatch(args: string[]) {
           let ev: any;
           try { ev = JSON.parse(payload); } catch { continue; }
           if (ev.ev === "error") { console.error("watch error:", ev.message); continue; }
-          if (ev.ev === "comment") emit(ev);
+          onEv(ev);
         }
       }
     } catch (e: any) {
@@ -1907,6 +1896,129 @@ async function commentsWatch(args: string[]) {
     if (!asJson) console.error(`… stream closed (host duration cap or network); reconnecting in ${delay}ms — the doorbell stays armed`);
     await new Promise((r) => setTimeout(r, delay));
   }
+}
+
+async function commentsWatch(args: string[]) {
+  const slug = await resolveSlug(args[0]);
+  if (!slug) return die("usage: drafty comments watch <slug> [--json] [--backlog] [--for DURATION]");
+  const asJson = has(args, "json");
+  if (!asJson) console.error(`👀 watching ${url(slug)} — new comments will appear here\n`);
+  await watchLoop(slug, args, asJson, (ev) => {
+    if (ev.ev !== "comment") return;
+    if (asJson) {
+      console.log(JSON.stringify({ annotationId: ev.annotationId, anchorTag: ev.anchorTag, anchorText: ev.anchorText, anchors: ev.anchors ?? null, anchorFx: ev.anchorFx ?? null, anchorFy: ev.anchorFy ?? null, status: ev.status, author: ev.author, body: ev.body, createdAt: ev.createdAt }));
+    } else {
+      console.log(`[${shortTime(ev.createdAt)}] ${ev.author} on ${anchorLabel(ev)}`);
+      console.log(`  ${ev.body}`);
+      console.log(`  ↳ reply: drafty comments reply ${ev.annotationId} "..."   resolve: drafty comments resolve ${ev.annotationId}\n`);
+    }
+  });
+}
+
+// ── the capture inbox — screenshot → agent fixes → proof ─────────────────────
+// The account's single inbox canvas: slug-less captures from the iOS/Mac apps
+// land there as `todo` entries (the board renders Todo/Doing/Done). The agent
+// loop: `inbox watch` (doorbell) → `inbox ls --status todo` → `claim` →
+// `classify` (on pickup, with the screenshot in view) → fix → `done --pr …
+// --proof …`. Done items stay on the board as the ledger, receipts attached.
+async function inboxLs(args: string[]) {
+  const query: Record<string, string> = {};
+  const status = flag(args, "status");
+  if (status) query.status = status;
+  const project = flag(args, "project");
+  if (project) query.project = project;
+  const r = await api("inbox.ls", { method: "GET", query });
+  if (has(args, "json")) {
+    console.log(JSON.stringify(r, null, 2));
+    return;
+  }
+  if (!r.slug) {
+    console.log("no inbox yet — share a capture from the Drafty iOS or Mac app and it appears here");
+    return;
+  }
+  const items = (r.items as any[]) || [];
+  console.log(`# Inbox — ${r.url}`);
+  if (!items.length) {
+    console.log(status || project ? "no matching items" : "inbox is empty");
+    return;
+  }
+  for (const it of items) {
+    const tagStr = Array.isArray(it.tags) && it.tags.length ? `  #${it.tags.join(" #")}` : "";
+    console.log(`• [${it.status}] ${it.summary || it.text || "(capture, unclassified)"}${it.project ? `  (${it.project})` : ""}${tagStr}`);
+    if (it.mediaUrl) console.log(`  media: ${it.mediaUrl}`);
+    if (it.status === "doing" && it.claimedBy) console.log(`  claimed by ${it.claimedBy}`);
+    if (it.status === "done") {
+      const receipts = [it.proofSlug ? `proof: ${BASE_URL}/canvas/${it.proofSlug}` : "", it.fixRef ? `pr: ${it.fixRef}` : ""].filter(Boolean).join("  ");
+      if (receipts) console.log(`  ${receipts}`);
+    }
+    console.log(`  id: ${it.entryId}\n`);
+  }
+}
+
+async function inboxClaim(args: string[]) {
+  const entryId = args.find((a) => !a.startsWith("--"));
+  if (!entryId) return die("usage: drafty inbox claim <entryId> [--agent name]");
+  const body: Record<string, unknown> = { entryId };
+  const agent = flag(args, "agent");
+  if (agent) body.agent = agent;
+  const r = await api("inbox.claim", { body });
+  console.log(`✓ claimed → doing  (${r.entryId})`);
+  console.log(`  classify it while the capture is in view: drafty inbox classify ${r.entryId} --project P --tag T --summary "…"`);
+}
+
+async function inboxClassify(args: string[]) {
+  const entryId = args.find((a) => !a.startsWith("--"));
+  if (!entryId) return die('usage: drafty inbox classify <entryId> [--project P] [--tag T …] [--summary "…"]');
+  const body: Record<string, unknown> = { entryId };
+  const project = flag(args, "project");
+  if (project) body.project = project;
+  const tags = multiFlag(args, "tag");
+  if (tags.length) body.tags = tags;
+  const summary = flag(args, "summary");
+  if (summary) body.summary = summary;
+  if (!(project || tags.length || summary)) return die("classify needs at least one of --project / --tag / --summary");
+  const r = await api("inbox.classify", { body });
+  console.log(`✓ classified  (${r.entryId})`);
+}
+
+async function inboxDone(args: string[]) {
+  const entryId = args.find((a) => !a.startsWith("--"));
+  if (!entryId) return die("usage: drafty inbox done <entryId> [--pr URL] [--proof slug]");
+  const body: Record<string, unknown> = { entryId };
+  const pr = flag(args, "pr");
+  if (pr) body.fixRef = pr;
+  const proof = flag(args, "proof");
+  if (proof) body.proofSlug = proof;
+  const r = await api("inbox.done", { body });
+  console.log(`✓ done  (${r.entryId})${pr || proof ? " — receipts attached" : ""}`);
+}
+
+async function inboxReopen(args: string[]) {
+  const entryId = args.find((a) => !a.startsWith("--"));
+  if (!entryId) return die("usage: drafty inbox reopen <entryId>");
+  const r = await api("inbox.reopen", { body: { entryId } });
+  console.log(`✓ reopened → todo  (${r.entryId})`);
+}
+
+async function inboxWatch(args: string[]) {
+  // The inbox doorbell: same SSE stream as comments watch, filtered to `entry`
+  // events (new captures). Resolve the inbox slug first; no inbox yet = nothing
+  // to watch (it's created by the first capture).
+  const r = await api("inbox.ls", { method: "GET", query: {} });
+  const slug = r.slug as string | null;
+  if (!slug) return die("no inbox yet — share a capture from the Drafty iOS or Mac app first");
+  const asJson = has(args, "json");
+  if (!asJson) console.error(`👀 watching your inbox (${url(slug)}) — new captures will appear here\n`);
+  await watchLoop(slug, args, asJson, (ev) => {
+    if (ev.ev !== "entry") return;
+    if (asJson) {
+      console.log(JSON.stringify({ entryId: ev.entryId, kind: ev.kind, text: ev.text ?? null, mediaUrl: ev.mediaUrl ?? null, mediaType: ev.mediaType ?? null, status: ev.status ?? null, project: ev.project ?? null, createdAt: ev.createdAt }));
+    } else {
+      console.log(`[${shortTime(ev.createdAt)}] new capture${ev.text ? `: ${ev.text}` : ""}`);
+      if (ev.mediaUrl) console.log(`  media: ${ev.mediaUrl}`);
+      console.log(`  ↳ claim it: drafty inbox claim ${ev.entryId}\n`);
+    }
+  });
 }
 
 // ── canvas management (owner-scoped via perms) ───────────────────────────────
@@ -2688,6 +2800,14 @@ COMMENTS — threads pinned to a canvas, and their replies
   drafty comments rm-reply <commentId>        delete a single reply
   drafty comments clear <slug> --yes          delete all threads on a canvas
 
+INBOX — your capture inbox: screenshots from the iOS/Mac apps, worked by agents
+  drafty inbox ls [--status todo|doing|done] [--project P] [--json]   the board as a task queue
+  drafty inbox watch [--json] [--backlog] [--for DUR]   stream new captures live (the doorbell)
+  drafty inbox claim <entryId> [--agent name]   take a todo item (todo → doing)
+  drafty inbox classify <entryId> [--project P] [--tag T …] [--summary "…"]   file it on pickup
+  drafty inbox done <entryId> [--pr URL] [--proof slug]   close it with receipts (doing → done)
+  drafty inbox reopen <entryId>               send it back to todo (receipts kept)
+
 LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
   drafty link create <slug|/path> [--code C] [--source S] [--medium M] [--campaign C] [--content C]   mint (or reuse) a shortlink
   drafty link ls [--json]                     your shortlinks, newest first
@@ -2727,6 +2847,9 @@ const COMMENTS: Record<string, Cmd> = {
   resolve: (a) => commentsStatus(a, "completed"), reopen: (a) => commentsStatus(a, "open"),
   rm: commentsRm, "rm-reply": commentsRmReply, clear: commentsClear,
 };
+const INBOX: Record<string, Cmd> = {
+  ls: inboxLs, claim: inboxClaim, classify: inboxClassify, done: inboxDone, reopen: inboxReopen, watch: inboxWatch,
+};
 const LINK: Record<string, Cmd> = { create: linkCreate, ls: linkLs, rm: linkRm, resolve: resolveCmd };
 // Top-level: session / meta — not scoped to a canvas or a comment.
 // `sweep` (released ≤0.25.0) folded into `tidy --sweep`; the alias keeps old
@@ -2750,6 +2873,7 @@ async function main() {
   // so existing muscle memory and older docs keep working.
   if (["canvas", "canvases", "documents", "document", "doc"].includes(head)) return runGroup("canvas", CANVAS, rest);
   if (head === "comments" || head === "comment") return runGroup("comments", COMMENTS, rest);
+  if (head === "inbox") return runGroup("inbox", INBOX, rest);
   if (head === "link" || head === "links") return runGroup("link", LINK, rest);
   if (head && TOP[head]) return TOP[head](rest);
   console.log(HELP);
