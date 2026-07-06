@@ -314,14 +314,16 @@ function die(msg: string): never {
 // A command's <slug> arg gets pasted in whatever shape the human has on hand:
 //   • bare slug:            launch-plan-9fk2q
 //   • full canvas URL:      https://drafty.im/canvas/launch-plan-9fk2q?ref=cli
-//   • short link:           https://drafty.im/l/at7cqt   (302 → /canvas/<slug>)
-//   • host-relative path:   /canvas/launch-plan-9fk2q  ·  /l/at7cqt
+//   • short link:           https://drafty.im/l/drafty-feedback-ni5yd1   (302 → /canvas/<slug>)
+//   • host-relative path:   /canvas/launch-plan-9fk2q  ·  /l/drafty-feedback-ni5yd1
 // Long forms are pure string-parsing; only a short link needs a network hop — we
 // follow its 302 ourselves so the agent never has to curl the redirect by hand.
 
 // The <code> out of any /l/<code> shape (URL, host-relative, or bare l/<code>), else null.
+// Codes are slug-shaped (e.g. drafty-feedback-ni5yd1), so hyphens are part of the code —
+// the char class must include them or the code truncates at the first hyphen.
 function shortlinkCode(input: string): string | null {
-  const m = input.trim().match(/(?:^|\/)l\/([a-z0-9]+)\b/i);
+  const m = input.trim().match(/(?:^|\/)l\/([a-z0-9-]+)\b/i);
   return m ? m[1] : null;
 }
 // The canvas slug out of a bare token or a …/canvas/<slug> URL/path. null when the
