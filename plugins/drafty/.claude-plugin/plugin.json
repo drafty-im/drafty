@@ -2,7 +2,7 @@
   "name": "drafty",
   "displayName": "Drafty",
   "description": "The review layer for AI-drafted work, in Claude Code. Publish a Markdown/HTML doc to drafty.im/canvas/<slug>, get Figma-style threaded comments anchored to exact elements, and ship a revised version on the same link — with history. The 'drafty' command is on PATH while enabled. Runs on Node 22.18+ or bun.",
-  "version": "0.38.0",
+  "version": "0.39.0",
   "author": {
     "name": "John Kueh",
     "url": "https://drafty.im"
