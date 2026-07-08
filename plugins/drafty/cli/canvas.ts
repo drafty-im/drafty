@@ -1922,10 +1922,11 @@ async function commentsWatch(args: string[]) {
 
 // ── the capture inbox — screenshot → agent fixes → proof ─────────────────────
 // The account's single inbox canvas: slug-less captures from the iOS/Mac apps
-// land there as `todo` entries (the board renders Todo/Doing/Done). The agent
-// loop: `inbox watch` (doorbell) → `inbox ls --status todo` → `claim` →
-// `classify` (on pickup, with the screenshot in view) → fix → `done --pr …
-// --proof …`. Done items stay on the board as the ledger, receipts attached.
+// land there as `todo` entries (the board renders Todo/Doing/Review/Done). The
+// agent loop: `inbox watch` (doorbell) → `inbox ls --status todo` → `claim` →
+// `classify` (on pickup, with the screenshot in view) → fix → `review --pr …
+// --proof …` (the agent's terminal action). `done` is the human's approval;
+// items stay on the board as the ledger, receipts attached.
 async function inboxLs(args: string[]) {
   const query: Record<string, string> = {};
   const status = flag(args, "status");
@@ -1952,7 +1953,7 @@ async function inboxLs(args: string[]) {
     console.log(`• [${it.status}] ${it.summary || it.text || "(capture, unclassified)"}${it.project ? `  (${it.project})` : ""}${tagStr}`);
     if (it.mediaUrl) console.log(`  media: ${it.mediaUrl}`);
     if (it.status === "doing" && it.claimedBy) console.log(`  claimed by ${it.claimedBy}`);
-    if (it.status === "done") {
+    if (it.status === "done" || it.status === "review") {
       const receipts = [it.proofSlug ? `proof: ${BASE_URL}/canvas/${it.proofSlug}` : "", it.fixRef ? `pr: ${it.fixRef}` : ""].filter(Boolean).join("  ");
       if (receipts) console.log(`  ${receipts}`);
     }
@@ -1996,6 +1997,18 @@ async function inboxDone(args: string[]) {
   if (proof) body.proofSlug = proof;
   const r = await api("inbox.done", { body });
   console.log(`✓ done  (${r.entryId})${pr || proof ? " — receipts attached" : ""}`);
+}
+
+async function inboxReview(args: string[]) {
+  const entryId = args.find((a) => !a.startsWith("--"));
+  if (!entryId) return die("usage: drafty inbox review <entryId> [--pr URL] [--proof slug]");
+  const body: Record<string, unknown> = { entryId };
+  const pr = flag(args, "pr");
+  if (pr) body.fixRef = pr;
+  const proof = flag(args, "proof");
+  if (proof) body.proofSlug = proof;
+  const r = await api("inbox.review", { body });
+  console.log(`✓ ready for review  (${r.entryId})${pr || proof ? " — receipts attached" : ""}`);
 }
 
 async function inboxReopen(args: string[]) {
@@ -2806,11 +2819,12 @@ COMMENTS — threads pinned to a canvas, and their replies
   drafty comments clear <slug> --yes          delete all threads on a canvas
 
 INBOX — your capture inbox: screenshots from the iOS/Mac apps, worked by agents
-  drafty inbox ls [--status todo|doing|done] [--project P] [--json]   the board as a task queue
+  drafty inbox ls [--status todo|doing|review|done] [--project P] [--json]   the board as a task queue
   drafty inbox watch [--json] [--backlog] [--for DUR]   stream new captures live (the doorbell)
   drafty inbox claim <entryId> [--agent name]   take a todo item (todo → doing)
   drafty inbox classify <entryId> [--project P] [--tag T …] [--summary "…"]   file it on pickup
-  drafty inbox done <entryId> [--pr URL] [--proof slug]   close it with receipts (doing → done)
+  drafty inbox review <entryId> [--pr URL] [--proof slug]   hand it back for approval with receipts (→ review)
+  drafty inbox done <entryId> [--pr URL] [--proof slug]   human approval — accept the work (→ done)
   drafty inbox reopen <entryId>               send it back to todo (receipts kept)
 
 LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
@@ -2853,7 +2867,7 @@ const COMMENTS: Record<string, Cmd> = {
   rm: commentsRm, "rm-reply": commentsRmReply, clear: commentsClear,
 };
 const INBOX: Record<string, Cmd> = {
-  ls: inboxLs, claim: inboxClaim, classify: inboxClassify, done: inboxDone, reopen: inboxReopen, watch: inboxWatch,
+  ls: inboxLs, claim: inboxClaim, classify: inboxClassify, review: inboxReview, done: inboxDone, reopen: inboxReopen, watch: inboxWatch,
 };
 const LINK: Record<string, Cmd> = { create: linkCreate, ls: linkLs, rm: linkRm, resolve: resolveCmd };
 // Top-level: session / meta — not scoped to a canvas or a comment.
