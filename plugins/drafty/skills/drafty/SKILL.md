@@ -53,6 +53,20 @@ the `noindex` URL unguessable. So:
 written, no path named, no single canvas in focus). A quick one-line clarification beats
 publishing the wrong thing.
 
+**Always pass `--title` and `--description` when you publish.** You have the full
+artifact in context — so write the metadata that makes the shared link unfurl well,
+rather than leaving it to a filename guess:
+
+- `--title` — a real, specific title for the artifact (not the filename). Short.
+- `--description` — one sentence (~120 chars) describing what the artifact *is* and
+  what reading it gets you. This becomes `og:description` on the link preview. Write
+  it plainly; no marketing voice. Re-pushing without `--description` keeps the
+  existing one.
+
+The canvas link unfurls with a screenshot of the artifact plus this title +
+description, so a good one-liner is what makes a shared canvas legible before
+anyone clicks.
+
 ## Markdown or HTML — match the format to the ask
 
 A canvas can be either. **Pick by what the user wants to look at, not by reflex.**
@@ -127,7 +141,7 @@ the update unprompted, since it changes their environment.
 
 | Command | What it does |
 |---|---|
-| `drafty canvas push <file> [--title T] [--slug S] [--mode M] [--visibility V] [--private]` | Publish a `.md`/`.html` file → prints the URL. Re-push with `--slug` to update + snapshot a revision. New canvases default to `feedback` mode and `public` visibility. |
+| `drafty canvas push <file> [--title T] [--description D] [--slug S] [--mode M] [--visibility V] [--private]` | Publish a `.md`/`.html` file → prints the URL. Re-push with `--slug` to update + snapshot a revision. New canvases default to `feedback` mode and `public` visibility. `--description` sets the link-unfurl summary (see above). |
 | `drafty canvas mode <slug> <readonly\|feedback\|live>` | Set how the canvas behaves when shared (see **Canvas modes** below). |
 | `drafty canvas visibility <slug> <public\|authed\|invite\|private>` | Set **who can view** it (orthogonal to mode, which is who can *comment*). `public` = anyone with the link (default); `authed` = any signed-in account; `invite`/`private` = the owner + invited emails only — server-enforced, so a private canvas's content is **not** served to anyone else. Use `--private` on `push` to publish straight to owner-only. |
 | `drafty comments ls <slug> [--json] [--open]` | Snapshot every thread + comment (your reading view). `--open` hides resolved. |
@@ -344,7 +358,7 @@ when ships mention the canvas URL — keep doing that (see **Archive on ship** a
 **Share a draft for feedback**
 1. Write the draft to a file — `.md` for text, `.html` for anything visual (see
    **Markdown or HTML** above), e.g. `/tmp/plan.md` or `/tmp/mockup.html`.
-2. `drafty canvas push /tmp/plan.md --title "Launch plan"` → give the user the URL.
+2. `drafty canvas push /tmp/plan.md --title "Launch plan" --description "Week-by-week rollout plan for the v2 launch — owners, dates, and the go/no-go gate."` → give the user the URL.
 3. Tell them: hover any line, click to comment; mark threads done as they're addressed.
 
 **React to feedback (socket mode)**
