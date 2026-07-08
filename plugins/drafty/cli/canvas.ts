@@ -585,7 +585,7 @@ function writeManifestEntry(file: string, entry: ManifestEntry): void {
 // ── commands ────────────────────────────────────────────────────────────────
 async function canvasPush(args: string[]) {
   const file = args[0];
-  if (!file) return die("usage: drafty canvas push <file> [--title T] [--slug S] [--mode M] [--format html|markdown] [--project P] [--tag T …] [--refresh]");
+  if (!file) return die("usage: drafty canvas push <file> [--title T] [--description D] [--slug S] [--mode M] [--format html|markdown] [--project P] [--tag T …] [--refresh]");
   const content = readFileSync(file, "utf8");
   if (!content.trim()) return die(`file is empty: ${file}`);
   // --format html|markdown is an explicit override; otherwise sniff content+extension.
@@ -594,6 +594,11 @@ async function canvasPush(args: string[]) {
     return die(`--format must be html or markdown (got "${formatFlag}")`);
   const format = (formatFlag as "html" | "markdown" | undefined) ?? inferFormat(file, content);
   const title = flag(args, "title") || inferTitle(content, format, file);
+  // One-line summary of the artifact for the link unfurl (og:description). The
+  // publishing agent writes this — it has the full content in context. The
+  // server only overwrites the stored description when one is sent, so a bare
+  // re-push keeps the existing unfurl text.
+  const description = flag(args, "description");
   const mode = parseMode(flag(args, "mode"));
   const visibility = parseVisibility(args);
   // Slug: an explicit --slug wins; otherwise the manifest remembers which canvas
@@ -621,7 +626,7 @@ async function canvasPush(args: string[]) {
   const published = await uploadLocalAssets(content, file);
   // targetSlug = update intent (exact); newSlug = pre-hashed slug if we create.
   const r = await api("canvas.push", {
-    body: { content: published, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(mode ? { mode } : {}), ...(visibility ? { visibility } : {}), ...(refresh ? { refresh: true } : {}), ...(baseRev != null ? { baseRev } : {}) },
+    body: { content: published, format, title, targetSlug: slug, newSlug: slugify(slug || title), ...(description ? { description } : {}), ...(mode ? { mode } : {}), ...(visibility ? { visibility } : {}), ...(refresh ? { refresh: true } : {}), ...(baseRev != null ? { baseRev } : {}) },
   });
   if (r.diverged) {
     const who = r.headAuthorKind === "human" ? `${r.headAuthor} (in the browser)` : r.headAuthor || "someone";
