@@ -1,0 +1,202 @@
+DRAFTY · ARCHITECTURE V2 — SUPERSEDES THE 2026-06-21 V1 (KEPT IN THIS CANVAS'S VERSION HISTORY)
+Always-Live Comments v2: claim registry & handler-of-last-resort
+The daemon is the handler of last resort, not the handler. A shared claim registry decides — per canvas — whether an attended Claude Code session or a spawned worker answers a comment. Attended always wins.
+Status: aligned — F3 & F4 decided 2026-07-02 (§9); §7 Jobs-to-be-done is the acceptance-criteria ledger for testing · v1 (this canvas's prior revision) + two Fable planning passes, all load-bearing claims re-verified in source 2026-07-02 · confirmed = read in source this pass · spike = needs a test before build · new in v2
+v1 answered "how does live survive without a babysat terminal?" — a zero-LLM launchd dispatcher spawning ephemeral claude --bg workers. John's follow-up exposed the gap: if all canvases are live and multiplexed, how do comments route to the right active session when one is already working that canvas with warm context? v2's answer: routing isn't stream plumbing, it's handler arbitration — a claim registry at the canvas grain, with the daemon as the only party that ever backs off.
+1What changed from v1 — the four findings
+Finding
+Consequence
+Instant has no compare-and-set. confirmed — instatx.d.ts: transaction ops are create/update/link/unlink/delete/merge; the only update option is {upsert:false}. No conditional-on-current-value write exists.
+The claim protocol cannot assume an atomic claim. It is designed to tolerate a lost race instead: deterministic daemon-backs-off tiebreak + the per-thread lease + baseRev are the real guards (§3).
+workingBy is decorative today. confirmed — both handler paths write the literal string "Claude" (instant-server.ts:617, :1923); the 10-min inbox exclusion keys only on the workingSince timestamp (:220 admin, :1633 worker).
+That's why the thread lease is symmetric: any handler's working-mark excludes the thread for every handler. Attended session and daemon worker get correct mutual exclusion with zero new code. (v1's "per-canvas lease already exists" claim was wrong — the only lease in source is per-annotation.)
+CLAUDE_CODE_SESSION_ID exists in the session env. confirmed live — present in foreground and --bg sessions.
+Handler identity is free: handlerId = "session:<id>@<host>". No id-minting infrastructure.
+handlerBy/handlerSeenAt is promoted from P3 UI nicety to load-bearing router. new in v2
+The claim registry becomes a hard dependency of the dispatcher — a daemon built without it spawns cold workers on top of a live attended session. Phase order re-sequences (§5).
+Also carried from the v1 verification pass: drafty.im/web is bun-locked (gate = web/scripts/ship-check.sh; never pnpm there); schema pushes only from the ship worktree; plugin/CLI release is its own authorization; source anchors drifted since 06-21 — current: documents.mode instant.schema.ts:62, worker watch() instant-server.ts:2102, inbox scope=live :686/:1892, ADMIN_OPS :1537, agent/cli comment filter :2119, CLI commentsWatch canvas.ts:1854, manifest canvas.ts:528-580.
+2The three grains — attribution, claim, lease
+slug                          → attribution: which canvas an event belongs to      [exists — stamped on multiplexed events]
+handlerBy / handlerSeenAt     → canvas claim: WHO handles; spawn-vs-defer router   [NEW — on documents, next to mode]
+workingSince / workingBy      → thread lease: last race-breaker, 10-min TTL        [exists — instant.schema.ts:211-212]
+Why the claim lives in Instant, not a dispatcher-local file: attended sessions must be visible to a dispatcher they didn't spawn; the web "Claude is here" spark reads the same fields (v1's P3 presence feature falls out for free); and P4 server-side workers later join the same registry as just another handlerBy class. The dispatcher's per-canvas lockfile survives but is demoted to daemon-vs-daemon double-spawn protection only.
+The handler-of-last-resort rule. A live canvas is handled by, in priority order: (1) an attended session that has claimed it — you're in a session working canvas A, it handles A, the daemon stands down; (2) nobody's on it — the daemon claims it and spawns the ephemeral worker. "Right comments → right session" is achieved by arbitration, not by routing the stream: every session and the daemon subscribe independently; the claim decides who acts.
+3The claim/defer protocol — precise spec
+Fields new in v2
+documents.handlerBy:     i.string().optional()   // "session:<CLAUDE_CODE_SESSION_ID>@<host>" | "daemon:<host>" | "cli:anon"
+documents.handlerSeenAt: i.number().optional()   // ms epoch, writer's clock
+Additive optionals next to mode (instant.schema.ts:62). Always written together in one update chunk — atomic as a write, last-writer-wins at the attr level (Instant's semantics; the protocol embraces it rather than fighting it).
+Claim-stamping rides existing ops — no new handshake command
+The "touch" ops — comments.working, comments.reply, canvas.push — additionally stamp {handlerBy, handlerSeenAt} on the parent document in the same transact (one extra chunk; one atomic commit). The CLI threads an optional handlerId; absent (old CLI versions) the server stamps "cli:anon" — which still reads as a fresh attended claim, so old CLIs deafen the daemon correctly, they just can't be named in observability. The only genuinely new op is canvas.heartbeat (renew + clear).
+Timers — the invariant is grace ≪ claim TTL < thread lease
+Parameter
+Value
+Rationale
+Heartbeat interval
+60s
+Written by the CLI watch loop + by the dispatcher for its workers
+Claim fresh TTL
+5 min
+5 missed heartbeats; > any SSE reconnect gap; < thread lease. Absorbs clock skew.
+One-shot touch claim
+5 min, no renewal
+"I just pushed/replied here, I'm probably still around" shadow
+Daemon grace window
+45s, debounced per canvas
+Lets an attended watcher wake + touch first; batches comment bursts
+Settle re-read
+2s after daemon writes its claim
+Lost-race detection (heuristic — see below)
+Thread lease
+10 min
+Existing TEN_MIN (:1571), unchanged
+Priority — attended > daemon, encoded as "the daemon is the only party that ever backs off"
+	1	Attended sessions claim unconditionally. Stamps ride their touch ops; the watch loop renews. They never check first, never defer — warm context wins by fiat.
+	2	The daemon never overwrites a fresh foreign claim. Fresh claim by someone else → defer, record in state.json, done.
+	3	Daemon claim sequence: comment event (or reconcile hit) → read claim → fresh+foreign? defer → else 45s grace → re-read → still empty/stale → write daemon:<host> → wait 2s → re-read → handlerBy != mine? lost the race, stand down → else spawn worker.
+	4	While the worker runs, the dispatcher heartbeats every 60s, re-reading first: if a session:* id overwrote the claim (John started working the canvas), the dispatcher gracefully drains — worker finishes its current thread (its workingSince marks keep those excluded from the attended inbox up to 10 min), takes no new ones, dispatcher claude stops it, and does not clear the claim (it isn't ours anymore).
+	5	On clean drain: dispatcher clears the claim (check-it's-still-ours, then write empty — benign race) so the web spark never lies.
+The honestly-un-closeable window (no CAS): two attended sessions, or daemon-write racing an attended-write inside the 2s settle. Degrades to exactly today's world: both handle briefly, workingSince excludes per-thread for whoever reads inbox second, baseRev guards pushes, worst case one duplicate reply. Accepted — no new failure mode is introduced.
+The one subtle wiring requirement: the dispatcher injects DRAFTY_HANDLER_ID=daemon:<host> into its workers' env, so a worker's own touches re-stamp the daemon id — without this, the daemon's worker would stamp an attended-looking id and the daemon would defer to itself.
+Claim expiry mid-handling
+	•	Attended lapses (session exits, lid closes): claim stales in ≤5 min → daemon takes the canvas on the next comment or reconcile tick. Threads the dead session working-marked stay excluded until the 10-min lease lapses — recovered, not double-handled. Correct behavior, not a bug.
+	•	Daemon worker dies mid-drain: dispatcher sees exit-without-drain → clears its claim, re-queues after backoff (governor-capped).
+canvas.heartbeat op spec new in v2
+Args {slug, handlerId, clear?}; writes {handlerBy, handlerSeenAt: now} (or clears both iff handlerBy === handlerId). Must not touch updatedAt — bumping it would reorder the /home listing and fake the "recent Claude activity" pulse (tripwire test, §7). Registered in ADMIN_OPS (:1537), BAN_WRITE_OPS (:279), and get-api-ops.ts so the HTTP smoke iterates it. Owner-only via existing document perms. Heartbeat write-amplification is safe confirmed: watch emits only unseen comment ids (seen set, :2105-2117), so heartbeats generate zero comment events.
+spike ×3 for this section: (a) whether an Instant perms CEL guard can express "allow update only if stale or same handler" — optional hardening, not a prerequisite; (b) admin-HTTP read-your-writes for the 2s settle re-read (expected yes — stateless commit — but exercise it); (c) strict-.create() duplicate error for a claim-entity alternative, only if (a) fails and stricter atomicity is ever wanted.
+4Eager-claim: NARROW — claim only what a session touches
+Resolved: narrow. A session claims a canvas only on actual touch, never by ambient presence:
+	1	drafty comments watch <slug> — claim on connect, renew via canvas.heartbeat every 60s from the CLI reconnect loop (canvas.ts:1898-1933), clear on clean exit.
+	2	comments.working / comments.reply / canvas.push on a live doc — one-shot 5-min stamp riding the op.
+	3	watch --live (multiplexed) claims nothing globally — the doorbell is not a claim; the touch is.
+Why broad ("every live canvas in the session's repo") loses: an idle terminal would silently deafen the daemon by existence, not activity — reintroducing the exact "live means dead" failure the daemon exists to kill. Sessions also aren't reliably repo-scoped (cwd ~/Projects is common), and a broad claim asserts intent that can't be honestly renewed. A wrong narrow claim self-corrects in ≤5 min; a wrong broad claim lasts as long as the terminal.
+The session-start "re-arm watches for every live canvas" ritual (SKILL.md:~206) is retired once the daemon ships — it is exactly the broad-claim behavior in ritual form. This also dissolves v1's open "doorbell duty" question: attended sessions self-claim what they touch; the daemon covers everything unclaimed. No enumeration, no per-session config.
+5Re-sequenced phases
+Host decision (unchanged from v1): hybrid, launchd-primary — the dispatcher is a bun script under launchd KeepAlive (drafty-cron substrate); drafty-mac gets a later optional menubar observer pane reading ~/.drafty/dispatcher/state.json. Hosting the dispatcher inside drafty-mac was rejected: Sparkle relaunch kills it mid-drain, crash-coupling with the capture app, wrong language for SSE/JSON/spawn work, and it would compile personal autonomy config into a publicly notarized app.
+Step
+What
+Where
+Status
+S1 (P0)
+Web Live/Park toggle calling existing canvas.mode. Independent; ships alone.
+presence-bar.tsx; op at instant-server.ts:850/:1985
+confirmed op exists · spike web mutation path (client transact vs API route, 15-min perms check)
+S2 (P1a)
+Multiplexed watch: SSE route accepts scope=live in lieu of slug; watch() branch subscribes documents where {creatorId, mode:"live"}; events gain slug; CLI --live; SKILL.md note incl. interim single-comms-session guidance (until S3, --live in at most one session).
+comments.watch/route.ts:20; instant-server.ts:2102+; canvas.ts:1854
+confirmed additive · spike live-query reacting to docs entering/leaving the result set
+S3 (P1b) promoted — was P3
+Claim registry: schema fields; canvas.heartbeat op + registrations; claim stamps in the three touch ops; CLI heartbeat loop + handlerId threading; presence-bar dual-read spark (roomPresence || fresh handlerSeenAt) — v1's P3 presence feature ships here for free.
+instant.schema.ts:62 (ship-worktree push ONLY); instant-server.ts; canvas.ts; presence-bar.tsx:32
+confirmed anchors · spike the 3 protocol spikes (§3)
+S4 (P1c)
+Dispatcher (hard-depends on S2+S3): launchd bun script; consumes CLI watch --live --json as child; per event → grace → claim sequence (§3) → context bundle (inbox JSON + shot --annotation per thread + pull + slug→repo) → spawn claude --bg --name "drafty: <slug>" perm-scoped → drain → dispatcher-owned claude stop → clear claim. Plus: ~/.drafty/canvases.json slug→repo write-through in canvas.push; CLAUDE.md carve-out note (the loop is zero-LLM launchd; workers are claude --bg, steerable — the claude -p ban holds).
+New private drafty-daemon skill dir (claude-skills-private); canvas.ts:572-580; ~/Projects/drafty.im/CLAUDE.md
+spike worker terminate-on-drain semantics; CLI inbox scope=live flag; exact allow/deny tool expressions
+S5 (P2)
+Hardening: since=<ts> reconnect cursor (route + watch() first-snapshot filter at :2118 + CLI); wedged-socket watchdog; backoff/jitter; claim-flap cooldown (per-canvas spawn cooldown after a drain or lost race).
+route.ts / instant-server.ts / canvas.ts / dispatcher
+confirmed where it lands; logic is new
+S6 (P3.5)
+drafty-mac observer pane: menu section from state.json (daemon status, live canvases, workers, claim table), Pause-all file, Park/Live per canvas, hidden when state file absent.
+drafty-mac/main.swift (+ new dispatcher-menu.swift in rebuild.sh:32)
+own release cadence (release.sh)
+S7 (P4)
+Server-side workers for self-contained canvases (Vercel → Claude API, laptop-off). They join the SAME claim registry as another handlerBy class — the reason the registry is in Instant.
+deferred
+—
+CLI halves of S2/S3 ride a plugin release — its own authorization, per standing rule. Web-side changes are additive and land first; old CLIs are unaffected (and still claim correctly as cli:anon).
+6Minimum shippable slice — unchanged: S1 + S2
+The claim registry does not need to be in the min slice: it arbitrates between two handler classes, and the second class (the daemon) doesn't exist until S4. In an S1+S2 world every handler is an attended session — exactly today's world, whose collision story (rare, human-visible, thread-lease-guarded, baseRev-guarded) is already acceptable — provided S2's SKILL.md ships the interim note: --live in one designated comms session only (without it, multiplexing makes every listening session wake for every comment, widening today's check-then-act window).
+The slice delivers the two failure modes John feels daily — one-tap Live/Park from the canvas, and one always-armed doorbell with zero re-arm ritual — in ~1–2 days, entirely on the daemon's critical path. The next increment after it is now S3 (small: one op, two fields, three op-stamp edits, one CLI loop), not the dispatcher.
+7Jobs to be done — the acceptance-criteria ledger
+Every user job the system must serve, mapped to the phase that delivers it. This table is the acceptance criteria for testing: a phase is done when its jobs' tests pass, and the whole system is done when all fifteen pass. Actor key: owner = John, commenter = a human viewer (invited or guest), session = an attended Claude Code session, worker = a daemon-spawned claude --bg agent.
+#
+Job (when… I can…)
+Phase
+Acceptance test
+J1
+Owner: when viewing any canvas I own, I can flip it Live or Park it with one tap on the canvas itself — no CLI, no session.
+S1
+Toggle visible to owner only; tap flips documents.mode live↔feedback; state persists on reload; a guest/invitee never sees the control.
+J2
+Session: when a session starts, one fixed command listens to ALL my live canvases — I never enumerate or re-arm per-canvas watches again.
+S2
+drafty comments watch --live --json streams a comment on canvas A and canvas B over one connection, each event carrying slug; the SKILL.md ritual is deleted.
+J3
+Owner: when I park a canvas (or take one live), every listener adjusts instantly — no client re-arm.
+S2
+With watch --live running: park canvas A → its comments stop arriving; take C live → C's comments start. No restart of the watch. spike-gated (live-query set changes).
+J4
+Commenter: when I comment on a live canvas and nobody is attending it, I get a real response (an answer, or the change published) without John touching a terminal.
+S4 (needs S2+S3)
+Comment on an unattended live canvas → within grace+spawn time a worker replies and/or pushes a new version, marks the thread resolved; zero human input.
+J5
+Session: when I'm actively working a canvas in an attended session, the daemon never double-handles it — no duplicate replies, no competing pushes.
+S3+S4
+Touch a canvas (working/reply/push) from a session, then comment on it → daemon logs deferred in state.json, spawns nothing while the claim is fresh.
+J6
+Owner: when I start working a canvas the daemon is mid-draining, it yields to me gracefully — finishes its current thread, takes no new ones.
+S4
+Overwrite a daemon claim with a session touch mid-drain → worker completes in-flight thread only, dispatcher stops it, claim left as the session's.
+J7
+Commenter: when I look at a live canvas, the "Claude is here" spark tells the truth — lit only when a handler (session or daemon) is actually fresh.
+S3
+Spark on while a watch/worker heartbeats; off within TTL of the handler dying; dispatcher clears its claim on drain (G7 claim-honesty).
+J8
+Commenter: when my session/laptop handling a canvas dies, my comment isn't stranded — the daemon takes over within minutes.
+S3+S4
+Kill the attended session mid-claim → claim stales ≤5 min → next comment or reconcile tick spawns a worker; working-marked threads recover after the 10-min lease.
+J9
+Owner: when a comment lands during an SSE reconnect gap or a daemon restart, it is still handled — nothing is silently lost.
+S2/S5
+Inject a comment while the stream is down → the reconcile sweep (interim) or the since=<ts> cursor (S5) picks it up; no comment older than one reconcile interval left unhandled.
+J10
+Owner: when a worker is running, I can see it, steer it, or stop it — nothing autonomous is invisible.
+S4
+Each worker = a named claude agents row (drafty: <slug>); claude logs/stop <id> work; row clears on drain; state.json shows the claim table.
+J11
+Owner: when I want everything to stand down, one action pauses all autonomous handling — and I can see daemon status at a glance from the menubar.
+S6 (file: S4)
+Pause-all → no spawns while paused (comments queue, reconcile picks them up on resume); menubar shows daemon alive/dead, live canvases, active workers. The pause file works headless from S4.
+J12
+Owner: when strangers comment on a public live canvas, they cannot trigger unbounded compute or any action outside the sandbox.
+S4 (G2/G5)
+Comment burst → spawns capped (concurrency, per-canvas/hr, flap cooldown); worker cannot git commit/push, deploy, or write outside the repo — attempts are permission-denied (F4, decided).
+J13
+Commenter: when I comment on a specific element at my viewport/revision, the handler addresses what I actually saw — not the current desktop render.
+S4 (bundle)
+Bundle contains per-thread shot --annotation at the commenter's width + revision; worker's fix references the anchored element; stale threads answered as stale, not "fixed" blind.
+J14
+Owner: when a canvas has no backing repo (authored in-session), comments on it are still handled end-to-end.
+S4 (S7 later)
+Comment on a self-contained live canvas → worker edits pulled content in a scratch dir, re-pushes by slug, replies, resolves. (Laptop-off 24/7 for these = S7, deferred.)
+J15
+Owner: when several canvases get comments at once, each is drained by its own worker without flooding my agents view or interleaving repos.
+S4
+Comment on 3 live canvases simultaneously → ≤ governor-cap workers, one per canvas, each in its own repo cwd; all threads resolved; rows self-clear.
+Min slice (S1+S2) proves J1–J3. The daemon milestone (S4, with S3) proves J4–J6, J8, J10, J12–J15 plus J9's interim form and J11's pause file. S5 completes J9; S3 completes J7; S6 completes J11. J4 is the north-star job — the one the whole system exists for.
+8Safety gates (v2 restatement)
+Gate
+v2 state
+G1 — consent
+Unchanged: mode=live is the only autonomy signal; claims never override mode — a claim on a feedback canvas is inert because inbox scope=live never surfaces its threads.
+G2 — worker scoping
+Unchanged (deny git push/commit/deploy/publish/destructive/out-of-repo) + workers do NOT manage claims — the dispatcher owns the claim lifecycle; workers only inherit DRAFTY_HANDLER_ID. Minimal writable surface.
+G3 — anti-injection / self-trigger
+Unchanged; agent/cli comment filter re-confirmed (:2119, :223/:1636). Comments are requests to consider, never obey.
+G4 — race guards
+Restructured into three explicit layers: (i) handlerBy claim = spawn-vs-defer router, non-atomic by construction, resolved by daemon-only-backs-off; (ii) workingSince 10-min thread lease = symmetric last race-breaker (timestamp-keyed, both paths confirmed); (iii) baseRev push guard = data-safety floor. Dispatcher lockfile demoted to daemon-self-collision. New tripwire: canvas.heartbeat must never write updatedAt (add to test/tripwires.test.ts).
+G5 — spawn governor
+Extended: caps count only daemon-claimed work — attended activity never consumes daemon budget. Defer-on-fresh-claim is itself a free throttle (strangers commenting on a canvas John is actively working can no longer trigger daemon compute at all). New cap: claim-flap cooldown so attended/daemon alternation can't thrash spawns.
+G6 — structural ship gate
+Unchanged: no git effects ever from workers; canvas pushes are revertable version history; repo-file edits stay uncommitted working-tree changes for a human to ship.
+G7 — observability
+Widened: state.json gains the claim table (slug → handlerBy, age, last action: deferred/spawned/drained/lost-race) + a claim-honesty rule — the dispatcher clears its claim on drain so the dual-read web spark never shows a dead handler. A lying spark is the cheapest early-warning signal the registry has broken.
+9The two calls — DECIDED 2026-07-02
+F3 — default new canvases to live? decided
+John's call: the control is a per-canvas switch on the canvas frontend UI — which is exactly S1's Live/Park toggle in the presence bar (one tap on the canvas, no CLI). Flipping the default for new canvases stays deferred until S4 has run quietly ~2 weeks; if flipped later, live-by-default for non-public (invite/authed) canvases first. With the daemon running, live-by-default would mean every future canvas is autonomously handled by default — and public canvases accept guest comments, so strangers could trigger compute.
+F4 — the autonomy dial decided
+John's call: approved as recommended. Auto-ship both replies and canvas pushes — both are version-historied and revertable (canvas revert), and push carries the baseRev guard. The gate that matters is structural, at the git layer: workers may edit repo working-tree files (recoverable) but are permission-denied git commit/push entirely — landing code stays a human act. "Draft-and-one-tap" is a property of the permission system, not of prompt obedience.
+
+v2 assembled 2026-07-02 from: the v1 canvas (prior revision of this canvas, 2026-06-21), the comments watch --live design canvas, John's handler-selection reconciliation, and two Fable planning passes with source re-verification (Instant SDK instatx.d.ts, instant-server.ts, canvas.ts, instant.schema.ts, presence-bar.tsx, live env check of CLAUDE_CODE_SESSION_ID). F3/F4 decided on-canvas 2026-07-02; §7 JTBD added the same day as the acceptance-criteria ledger. Nothing here is built — next step is the S1+S2 min slice, accepted against J1–J3.

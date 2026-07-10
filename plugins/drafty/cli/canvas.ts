@@ -12,7 +12,7 @@
 // greps the source to keep it that way.
 import { basename, dirname, join, resolve } from "node:path";
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, chmodSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
@@ -216,6 +216,15 @@ function multiFlag(args: string[], name: string): string[] {
 }
 const url = (slug: string) => `${BASE_URL}/canvas/${slug}`;
 const shortTime = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+// The dispatcher injects its daemon identity into workers. Otherwise an
+// attended Claude Code session is named from its stable session id + host; a
+// plain terminal leaves this absent and the server stamps it as cli:anon.
+function handlerId(): string | undefined {
+  const injected = process.env.DRAFTY_HANDLER_ID?.trim();
+  if (injected) return injected;
+  const session = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  return session ? `session:${session}@${hostname()}` : undefined;
+}
 // Parse a human duration → ms: "20m", "90s", "1h", "500ms", or a bare number (= seconds).
 // null if unparseable. Lets long-running commands self-bound without an external
 // `timeout` (which macOS doesn't ship — the classic agent "command not found: timeout").
@@ -401,10 +410,13 @@ async function api(op: string, opts: ApiOpts = {}): Promise<any> {
   // must authorize with the canvas's provision token, so callers pass it in.
   const token = opts.token ?? (await getToken());
   const qs = opts.query ? "?" + new URLSearchParams(opts.query).toString() : "";
+  const id = handlerId();
+  const isTouch = op === "comments.working" || op === "comments.reply" || op === "canvas.push";
+  const body = opts.body && isTouch ? { ...opts.body, ...(id ? { handlerId: id } : {}) } : opts.body;
   const reqInit = {
     method: opts.method ?? "POST",
-    headers: { authorization: `Bearer ${token}`, ...(opts.body ? { "content-type": "application/json" } : {}) },
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
   };
   const MAX = 3;
   let lastErr = `${op} failed`;
@@ -1840,22 +1852,59 @@ async function commentsInbox(args: string[]) {
 // success, not a failure (the old "wrap it in `timeout`" path died with 127 on
 // macOS, which has no `timeout`). The SSE loop keeps the process alive, so the
 // timer reliably fires; unref'd so it can never itself hold exit open.
-async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (ev: any) => void, live = false) {
+async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (ev: any) => void, live = false, claim = false) {
   const token = await getToken();
+  let stop = false;
+  let streamAbort: AbortController | null = null;
+  let closing: Promise<void> | null = null;
+  let heartbeatWarned = false;
+
+  // Heartbeats are presence metadata, never a reason to lose the doorbell.
+  // Keep this off api(): api() deliberately exits on failure for user actions.
+  const heartbeat = async (clear = false): Promise<void> => {
+    if (!claim) return;
+    const id = handlerId();
+    try {
+      const res = await fetch(`${BASE_URL}/get/api/canvas.heartbeat`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ slug, ...(id ? { handlerId: id } : {}), ...(clear ? { clear: true } : {}) }),
+        signal: AbortSignal.timeout(2500),
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) throw new Error(data.error || `heartbeat failed (${res.status})`);
+    } catch (e: any) {
+      if (!asJson && !heartbeatWarned) {
+        heartbeatWarned = true;
+        console.error(`watch heartbeat: ${e?.message ?? e} (continuing without claim renewal)`);
+      }
+    }
+  };
+
+  const cleanExit = (elapsed?: string): Promise<void> => {
+    if (closing) return closing;
+    closing = (async () => {
+      stop = true;
+      streamAbort?.abort();
+      if (elapsed && !asJson) console.error(elapsed);
+      await heartbeat(true);
+      process.exit(0);
+    })();
+    return closing;
+  };
+
   const forRaw = flag(args, "for") ?? flag(args, "timeout");
   if (forRaw !== undefined) {
     const ms = parseDurationMs(forRaw);
     if (ms === null || ms <= 0) return die(`--for: couldn't read duration "${forRaw}" — try 20m, 90s, 1h, or a plain number of seconds`);
     const t = setTimeout(() => {
-      if (!asJson) console.error(`\n⏲ watch window (${forRaw}) elapsed — exiting cleanly. Re-run to keep listening.`);
-      process.exit(0);
+      void cleanExit(`\n⏲ watch window (${forRaw}) elapsed — exiting cleanly. Re-run to keep listening.`);
     }, ms);
     if (typeof t.unref === "function") t.unref();
     if (!asJson) console.error(`   (auto-exits after ${forRaw} — no external \`timeout\` needed)`);
   }
 
-  let stop = false;
-  process.on("SIGINT", () => { stop = true; process.exit(0); });
+  process.once("SIGINT", () => { void cleanExit(); });
 
   // SSE connections don't live forever — a serverless host (Vercel) caps a
   // function's duration, so the stream WILL drop periodically. Reconnect so the
@@ -1869,12 +1918,22 @@ async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (e
     // connection: send scope=live in lieu of a slug (the server resolves the
     // creator from the auth token and multiplexes; each event carries its slug).
     const qs = new URLSearchParams({ ...(live ? { scope: "live" } : { slug }), ...(has(args, "backlog") && attempt === 0 ? { backlog: "1" } : {}) });
+    let renew: ReturnType<typeof setInterval> | undefined;
     try {
+      streamAbort = new AbortController();
       const res = await fetch(`${BASE_URL}/get/api/comments.watch?${qs}`, {
         headers: { authorization: `Bearer ${token}`, accept: "text/event-stream" },
+        signal: streamAbort.signal,
       });
       if (!res.ok || !res.body) throw new Error(`watch failed (${res.status})`);
       attempt = 0;
+      // A successful single-canvas connection is the attended claim. Renew only
+      // while this stream is up; reconnecting establishes a fresh claim.
+      await heartbeat();
+      if (claim) {
+        renew = setInterval(() => { void heartbeat(); }, 60_000);
+        if (typeof renew.unref === "function") renew.unref();
+      }
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
@@ -1897,13 +1956,19 @@ async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (e
         }
       }
     } catch (e: any) {
-      if (!asJson) console.error(`watch: ${e?.message ?? e}`);
+      if (!stop && !asJson) console.error(`watch: ${e?.message ?? e}`);
+    } finally {
+      if (renew) clearInterval(renew);
+      streamAbort = null;
     }
     if (stop) break;
     const delay = Math.min(1000 * 2 ** attempt++, 10000); // backoff, capped 10s
     if (!asJson) console.error(`… stream closed (host duration cap or network); reconnecting in ${delay}ms — the doorbell stays armed`);
     await new Promise((r) => setTimeout(r, delay));
   }
+  // cleanExit aborts the reader, which makes the loop finish concurrently with
+  // its clear request. Do not let main()'s final process.exit beat that request.
+  if (closing) await closing;
 }
 
 async function commentsWatch(args: string[]) {
@@ -1913,7 +1978,7 @@ async function commentsWatch(args: string[]) {
 
   // --live and a <slug> are mutually exclusive: --live streams comments from
   // EVERY canvas the creator has live (scope=live in lieu of a slug), each event
-  // tagged with its own slug. A slug watch stays exactly as before.
+  // tagged with its own slug. A slug watch remains single-canvas.
   if (live && slugArg) return die("comments watch: pass a <slug> OR --live, not both — --live streams every one of your live canvases over one connection");
 
   if (live) {
@@ -1947,7 +2012,7 @@ async function commentsWatch(args: string[]) {
       console.log(`  ${ev.body}`);
       console.log(`  ↳ reply: drafty comments reply ${ev.annotationId} "..."   resolve: drafty comments resolve ${ev.annotationId}\n`);
     }
-  });
+  }, false, true);
 }
 
 // ── the capture inbox — screenshot → agent fixes → proof ─────────────────────
@@ -2839,7 +2904,7 @@ CANVAS — the canvas you publish
 COMMENTS — threads pinned to a canvas, and their replies
   drafty comments ls <slug> [--json] [--open]   threads + replies on a canvas
   drafty comments inbox [slug] [--json] [--all]   fresh threads that need Claude
-  drafty comments watch <slug> [--json] [--backlog] [--for DUR]   stream new comments live (SSE doorbell); --for 20m self-exits, no external timeout needed
+  drafty comments watch <slug> [--json] [--backlog] [--for DUR]   stream + mark this canvas attended (daemon defers); --live is doorbell-only and claims nothing
   drafty comments watch --live [--json] [--for DUR]   stream comments from EVERY canvas you have live over ONE connection; each event is tagged with its slug (run in one comms session)
   drafty comments create <slug> --anchor "<text>" [--at fx,fy] "<msg>"   open a NEW thread as Claude (--canvas for an unanchored note)
   drafty comments reply <annotationId> "<message>"   reply in a thread as Claude
