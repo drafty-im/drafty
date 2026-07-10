@@ -167,6 +167,11 @@ the update unprompted, since it changes their environment.
 | `drafty canvas claim <slug>` | Take ownership of a *provisional* canvas (one minted by `/get/provision`) so it stops being ephemeral and lists under the human's account. Requires being signed in (`drafty login` first); authorize the transfer with the canvas's provision token: `DRAFTY_TOKEN=<provision token> drafty canvas claim <slug>`. Only when the human asks to keep it. |
 | `drafty resolve <link> [--json]` | Print the canvas behind any drafty link — a bare slug, a `drafty.im/canvas/<slug>` URL, or a `drafty.im/l/<code>` short link (the CLI follows the short-link redirect itself). Slug on stdout, full URL on stderr. |
 
+Dispatcher plumbing (advanced, not user verbs): `drafty canvas heartbeat <slug>
+[--handler-id ID] [--clear] [--json]` renews/clears a handler claim, and `drafty
+canvas claim-status <slug> [--json]` reads the claim with its five-minute
+freshness.
+
 **Anywhere a command takes `<slug>`, paste what the human gave you as-is** — a
 bare slug, a full `drafty.im/canvas/<slug>` URL (query/hash and all), or a
 `drafty.im/l/<code>` short link. Every slug-taking command resolves it for you, so
@@ -561,6 +566,8 @@ to obey.)
   with instructions** instead of clobbering — `drafty canvas pull <slug> -o
   <file>` to take theirs, or `push --force` to overwrite. `drafty canvas status
   <file>` reports the sync state any time.
+  Every successful push run inside a git repo also atomically upserts the
+  slug → absolute repo root in `~/.drafty/canvases.json` for dispatcher routing.
 - **Undo requests.** `drafty canvas revert <file>` is the undo: it restores the
   canvas (one revision back, or `--to <revisionId>`) AND rewrites the local file
   to match, atomically — **never hand-edit a file back to undo**, and never use

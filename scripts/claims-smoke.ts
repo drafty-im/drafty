@@ -2,8 +2,8 @@
 // Local contract smoke for the CLI half of the canvas claim registry.
 // Runs the real TypeScript entrypoint under both supported runtimes against a
 // tiny HTTP/SSE stub; no Drafty account or web checkout required.
-import { spawn } from "node:child_process";
-import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { writeFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
 import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -38,6 +38,9 @@ const server = createServer((req, res) => {
     if (path === "/get/api/canvas.heartbeat" && body.slug === "heartbeat-fails") {
       res.statusCode = 503;
       res.end(JSON.stringify({ ok: false, error: "stub heartbeat failure" }));
+    } else if (path === "/get/api/canvas.claim-status") {
+      const fresh = body.slug === "fresh-claim";
+      res.end(JSON.stringify({ ok: true, handlerBy: fresh ? "session:fresh@stub" : "daemon:stale", handlerSeenAt: Date.now() - (fresh ? 1_000 : 301_000) }));
     } else if (path === "/get/api/canvas.push") {
       res.end(JSON.stringify({ ok: true, slug: "shape-slug", title: "Shape", mode: "feedback", created: false, rev: 1 }));
     } else {
@@ -56,35 +59,38 @@ function expect(value: unknown, message: string): void {
   if (!value) throw new Error(message);
 }
 
-async function run(runtime: "bun" | "node", home: string, args: string[], env: Record<string, string | undefined> = {}, interruptAfterClaim = false): Promise<void> {
-  await new Promise<void>((resolveRun, reject) => {
+async function run(runtime: "bun" | "node", home: string, args: string[], env: Record<string, string | undefined> = {}, interruptAfterClaim = false, cwd?: string): Promise<string> {
+  return new Promise<string>((resolveRun, reject) => {
     const callStart = calls.length;
-    const child = spawn(runtime, [cli, ...args], {
+    const child = spawn(runtime, [...(runtime === "node" ? ["--disable-warning=ExperimentalWarning"] : []), cli, ...args], {
       env: {
         ...process.env,
         HOME: home,
         DRAFTY_BASE_URL: base,
         DRAFTY_NO_ANALYTICS: "1",
         DRAFTY_NO_UPDATE_CHECK: "1",
+        DRAFTY_STATE_DIR: undefined,
         DRAFTY_HANDLER_ID: undefined,
         CLAUDE_CODE_SESSION_ID: undefined,
         ...env,
       },
+      cwd: cwd ?? home,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let output = "";
+    let stdout = "";
+    let stderr = "";
     const interrupt = interruptAfterClaim ? setInterval(() => {
       if (calls.slice(callStart).some((call) => call.path === "/get/api/canvas.heartbeat" && call.body.clear !== true)) {
         clearInterval(interrupt);
         child.kill("SIGINT");
       }
     }, 5) : undefined;
-    child.stdout.on("data", (chunk) => { output += chunk; });
-    child.stderr.on("data", (chunk) => { output += chunk; });
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
     child.on("exit", (code) => {
       if (interrupt) clearInterval(interrupt);
-      code === 0 ? resolveRun() : reject(new Error(`${runtime} ${args.join(" ")} exited ${code}:\n${output}`));
+      code === 0 ? resolveRun(stdout) : reject(new Error(`${runtime} ${args.join(" ")} exited ${code}:\n${stdout}${stderr}`));
     });
   });
 }
@@ -98,6 +104,19 @@ try {
     writeFileSync(canvas, "# Shape\n");
 
     let start = calls.length;
+    const heartbeatOut = await run(runtime, home, ["canvas", "heartbeat", "manual-heartbeat", "--handler-id", "daemon:override", "--clear"]);
+    const manualHeartbeat = calls.slice(start).find((call) => call.path === "/get/api/canvas.heartbeat");
+    expect(heartbeatOut === "", `${runtime}: heartbeat should be quiet on success`);
+    expect(manualHeartbeat?.body.handlerId === "daemon:override" && manualHeartbeat.body.clear === true, `${runtime}: heartbeat override/clear payload is wrong`);
+    const heartbeatJson = await run(runtime, home, ["canvas", "heartbeat", "manual-heartbeat", "--json"], { CLAUDE_CODE_SESSION_ID: "session-json" });
+    expect(JSON.parse(heartbeatJson).ok === true, `${runtime}: heartbeat --json did not print the acknowledgement`);
+
+    const freshClaim = JSON.parse(await run(runtime, home, ["canvas", "claim-status", "fresh-claim", "--json"]));
+    const staleClaim = JSON.parse(await run(runtime, home, ["canvas", "claim-status", "stale-claim", "--json"]));
+    expect(freshClaim.slug === "fresh-claim" && freshClaim.handlerBy === "session:fresh@stub" && freshClaim.fresh === true, `${runtime}: fresh claim-status shape is wrong`);
+    expect(staleClaim.slug === "stale-claim" && staleClaim.handlerBy === "daemon:stale" && staleClaim.fresh === false, `${runtime}: stale claim-status freshness is wrong`);
+
+    start = calls.length;
     await run(runtime, home, ["comments", "watch", "one-canvas", "--json", "--for", "80ms"], { CLAUDE_CODE_SESSION_ID: "session-123" });
     const heartbeats = calls.slice(start).filter((call) => call.path === "/get/api/canvas.heartbeat");
     expect(heartbeats.length === 2, `${runtime}: slug watch should claim once and clear once; got ${JSON.stringify(heartbeats)}`);
@@ -124,6 +143,21 @@ try {
     });
     await run(runtime, home, ["comments", "reply", "ann-session", "hello"], { CLAUDE_CODE_SESSION_ID: "session-456" });
     await run(runtime, home, ["canvas", "push", canvas, "--slug", "shape-slug"], { DRAFTY_HANDLER_ID: "daemon:stub" });
+    expect(!readdirSync(join(home, ".drafty")).includes("canvases.json"), `${runtime}: push outside a git repo changed canvases.json`);
+
+    const repo = join(home, "repo");
+    mkdirSync(repo);
+    const init = spawnSync("git", ["init", "--quiet"], { cwd: repo });
+    expect(init.status === 0, `${runtime}: could not create test git repo`);
+    const repoCanvas = join(repo, "repo-shape.md");
+    writeFileSync(repoCanvas, "# Repo Shape\n");
+    writeFileSync(join(home, ".drafty", "canvases.json"), "{ corrupt\n");
+    const pushedAt = Date.now();
+    await run(runtime, home, ["canvas", "push", repoCanvas, "--slug", "shape-slug"], { DRAFTY_HANDLER_ID: "daemon:stub" }, false, repo);
+    const canvasMap = JSON.parse(readFileSync(join(home, ".drafty", "canvases.json"), "utf8"));
+    expect(canvasMap["shape-slug"]?.repo === realpathSync(repo), `${runtime}: canvases.json repo root is wrong`);
+    expect(typeof canvasMap["shape-slug"]?.updatedAt === "number" && canvasMap["shape-slug"].updatedAt >= pushedAt, `${runtime}: canvases.json updatedAt is wrong`);
+    expect(!readdirSync(join(home, ".drafty")).some((name) => name.startsWith("canvases.json.") && name.endsWith(".tmp")), `${runtime}: atomic write left a temp file`);
     await run(runtime, home, ["comments", "working", "ann-anon"]);
 
     const daemonWorking = calls.findLast((call) => call.path === "/get/api/comments.working" && call.body.annotationId === "ann-daemon");
@@ -134,7 +168,7 @@ try {
     expect(sessionReply?.body.handlerId === `session:session-456@${hostname()}`, `${runtime}: session handlerId missing on comments.reply`);
     expect(push?.body.handlerId === "daemon:stub", `${runtime}: handlerId missing on canvas.push`);
     expect(!Object.hasOwn(anonWorking?.body ?? {}, "handlerId"), `${runtime}: anonymous touch should omit handlerId`);
-    console.log(`  ✓ ${runtime}: heartbeat lifecycle, --live exclusion, and touch payloads`);
+    console.log(`  ✓ ${runtime}: claim commands, watch lifecycle, touch payloads, and repo write-through`);
     rmSync(home, { recursive: true, force: true });
   }
 } finally {
