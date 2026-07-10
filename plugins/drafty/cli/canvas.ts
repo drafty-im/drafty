@@ -11,7 +11,7 @@
 // with native type stripping. No bun-only globals or meta fields — preflight
 // greps the source to keep it that way.
 import { basename, dirname, join, resolve } from "node:path";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, chmodSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, chmodSync, statSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -28,6 +28,7 @@ const TOKEN_FILE = join(STATE_DIR, "token");
 // drop-to-guest LOUD instead of silent (see getToken / main) — so a lost session
 // can never quietly publish under a throwaway guest.
 const IDENTITY_FILE = join(STATE_DIR, "identity.json");
+const CANVASES_FILE = join(STATE_DIR, "canvases.json");
 type Identity = { signedIn?: boolean; email?: string; userId?: string; sessionLost?: boolean };
 
 function readIdentity(): Identity | null {
@@ -594,6 +595,32 @@ function writeManifestEntry(file: string, entry: ManifestEntry): void {
   } catch { /* the manifest is a convenience — never fail the command on it */ }
 }
 
+// Dispatcher lookup: a successful push from a git working tree binds the
+// canvas slug to that tree. This is deliberately separate from the per-repo
+// file manifest above: the zero-LLM dispatcher needs one account-wide index it
+// can read before it knows which repo to enter. A temp file in the same
+// directory + rename keeps readers from ever observing a partial JSON write.
+function writeCanvasRepo(slug: string): void {
+  const root = gitContext().root;
+  if (!root) return;
+  let all: Record<string, { repo: string; updatedAt: number }> = {};
+  try {
+    if (existsSync(CANVASES_FILE)) {
+      const parsed: unknown = JSON.parse(readFileSync(CANVASES_FILE, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) all = parsed as typeof all;
+    }
+  } catch { /* corrupt state is rebuilt with this known-good entry */ }
+  all[slug] = { repo: resolve(root), updatedAt: Date.now() };
+  const tmp = `${CANVASES_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    writeFileSync(tmp, JSON.stringify(all, null, 2) + "\n", { mode: 0o600 });
+    renameSync(tmp, CANVASES_FILE);
+  } catch {
+    try { rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ }
+  }
+}
+
 // ── commands ────────────────────────────────────────────────────────────────
 async function canvasPush(args: string[]) {
   const file = args[0];
@@ -650,6 +677,7 @@ async function canvasPush(args: string[]) {
       `    drafty canvas push ${file} --force        # overwrite it with yours`,
     );
   }
+  writeCanvasRepo(r.slug);
   // Record what we just synced: slug (bare re-push targets the same canvas),
   // rev/revisionId (the guard's base next time), and the local content hash
   // (status's local-ahead check). Servers predating rev/revisionId return
@@ -2301,6 +2329,32 @@ async function canvasShow(args: string[]) {
   if (d.updatedAt) console.log(`  updated ${relTime(d.updatedAt)}`);
 }
 
+// Dispatcher plumbing. Heartbeat is intentionally quiet unless its raw JSON
+// acknowledgement is requested; failures flow through api()'s standard
+// message + nonzero exit path.
+async function canvasHeartbeat(args: string[]) {
+  const slug = await resolveSlug(args[0]);
+  if (!slug || slug.startsWith("--")) return die("usage: drafty canvas heartbeat <slug> [--handler-id <id>] [--clear] [--json]");
+  const override = flag(args, "handler-id");
+  if (has(args, "handler-id") && (!override || override.startsWith("--"))) return die("--handler-id needs a value");
+  const id = override ?? handlerId();
+  const r = await api("canvas.heartbeat", {
+    body: { slug, ...(id ? { handlerId: id } : {}), ...(has(args, "clear") ? { clear: true } : {}) },
+  });
+  if (has(args, "json")) console.log(JSON.stringify(r));
+}
+
+async function canvasClaimStatus(args: string[]) {
+  const slug = await resolveSlug(args[0]);
+  if (!slug || slug.startsWith("--")) return die("usage: drafty canvas claim-status <slug> [--json]");
+  const r = await api("canvas.claim-status", { body: { slug } });
+  const handlerBy = typeof r.handlerBy === "string" ? r.handlerBy : null;
+  const handlerSeenAt = typeof r.handlerSeenAt === "number" ? r.handlerSeenAt : null;
+  const out = { slug, handlerBy, handlerSeenAt, fresh: handlerSeenAt !== null && Date.now() - handlerSeenAt <= 5 * 60_000 };
+  if (has(args, "json")) console.log(JSON.stringify(out));
+  else console.log(JSON.stringify(out, null, 2));
+}
+
 // Best-effort local repo context, so the agent can infer a project and decide
 // create-vs-update. Every field is null outside a git repo / when git is absent.
 function gitContext(): { cwd: string; root: string | null; repo: string | null; branch: string | null; dirty: boolean | null } {
@@ -2901,6 +2955,10 @@ CANVAS — the canvas you publish
   drafty canvas rm <slug> --yes            remove a canvas entirely
   drafty canvas claim <slug>               keep a provisional canvas (DRAFTY_TOKEN=<provision token>)
 
+ADVANCED — dispatcher plumbing (not user verbs)
+  drafty canvas heartbeat <slug> [--handler-id ID] [--clear] [--json]   renew/clear a canvas handler claim (quiet on success)
+  drafty canvas claim-status <slug> [--json]   read handlerBy/handlerSeenAt + 5-minute freshness
+
 COMMENTS — threads pinned to a canvas, and their replies
   drafty comments ls <slug> [--json] [--open]   threads + replies on a canvas
   drafty comments inbox [slug] [--json] [--all]   fresh threads that need Claude
@@ -2956,6 +3014,7 @@ const CANVAS: Record<string, Cmd> = {
   archive: (a) => canvasArchive(a, true), unarchive: (a) => canvasArchive(a, false), close: canvasClose,
   pin: (a) => canvasPin(a, true), unpin: (a) => canvasPin(a, false),
   mode: canvasMode, visibility: canvasVisibility, rm: canvasRm, claim: canvasClaim,
+  heartbeat: canvasHeartbeat, "claim-status": canvasClaimStatus,
 };
 const COMMENTS: Record<string, Cmd> = {
   ls: commentsLs, inbox: commentsInbox, watch: commentsWatch, create: commentsCreate, reply: commentsReply, working: commentsWorking,
