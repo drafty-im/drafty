@@ -18,6 +18,10 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
 
 const BASE_URL = process.env.DRAFTY_BASE_URL || "https://drafty.im";
+const DRAFTY_WATCH_STALL_MS = (() => {
+  const configured = Number(process.env.DRAFTY_WATCH_STALL_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 90_000;
+})();
 // Login/token/manifest state lives in ~/.drafty by default. DRAFTY_STATE_DIR
 // overrides it so a sandboxed run (an e2e harness, or an agent under test) keeps
 // its login fully separate from the real ~/.drafty — same spirit as DRAFTY_BASE_URL.
@@ -1886,6 +1890,7 @@ async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (e
   let streamAbort: AbortController | null = null;
   let closing: Promise<void> | null = null;
   let heartbeatWarned = false;
+  let maxCreatedAt: number | null = null;
 
   // Heartbeats are presence metadata, never a reason to lose the doorbell.
   // Keep this off api(): api() deliberately exits on failure for user actions.
@@ -1936,17 +1941,22 @@ async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (e
 
   // SSE connections don't live forever — a serverless host (Vercel) caps a
   // function's duration, so the stream WILL drop periodically. Reconnect so the
-  // doorbell stays armed for the whole session. Events that land during the
-  // brief reconnect gap are caught by the next inbox reconcile (the doorbell
-  // wakes you; inbox is the source of truth). Only the first connect honours
-  // --backlog; reconnects start fresh so old events aren't replayed.
+  // doorbell stays armed for the whole session. Reconnects carry the greatest
+  // emitted createdAt so the server can replay events that landed during the
+  // gap. Only the first connect honours --backlog.
   let attempt = 0;
   while (!stop) {
     // --live streams comments for ALL the creator's live canvases over one
     // connection: send scope=live in lieu of a slug (the server resolves the
     // creator from the auth token and multiplexes; each event carries its slug).
-    const qs = new URLSearchParams({ ...(live ? { scope: "live" } : { slug }), ...(has(args, "backlog") && attempt === 0 ? { backlog: "1" } : {}) });
+    const qs = new URLSearchParams({
+      ...(live ? { scope: "live" } : { slug }),
+      ...(has(args, "backlog") && attempt === 0 ? { backlog: "1" } : {}),
+      ...(attempt > 0 && maxCreatedAt !== null ? { since: String(maxCreatedAt) } : {}),
+    });
     let renew: ReturnType<typeof setInterval> | undefined;
+    let stallTimer: ReturnType<typeof setTimeout> | undefined;
+    let stalled = false;
     try {
       streamAbort = new AbortController();
       const res = await fetch(`${BASE_URL}/get/api/comments.watch?${qs}`, {
@@ -1965,9 +1975,20 @@ async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (e
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
+      const resetStallTimer = () => {
+        if (stallTimer) clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => {
+          stalled = true;
+          streamAbort?.abort();
+        }, DRAFTY_WATCH_STALL_MS);
+        if (typeof stallTimer.unref === "function") stallTimer.unref();
+      };
+      resetStallTimer();
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break; // stream closed (host duration cap or network) → reconnect
+        if (!value.byteLength) continue;
+        resetStallTimer(); // every byte-bearing chunk counts, including SSE keepalives
         buf += dec.decode(value, { stream: true });
         let idx: number;
         while ((idx = buf.indexOf("\n\n")) >= 0) {
@@ -1980,17 +2001,22 @@ async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (e
           let ev: any;
           try { ev = JSON.parse(payload); } catch { continue; }
           if (ev.ev === "error") { console.error("watch error:", ev.message); continue; }
+          if (typeof ev.createdAt === "number" && Number.isFinite(ev.createdAt)) {
+            maxCreatedAt = Math.max(maxCreatedAt ?? ev.createdAt, ev.createdAt);
+          }
           onEv(ev);
         }
       }
     } catch (e: any) {
-      if (!stop && !asJson) console.error(`watch: ${e?.message ?? e}`);
+      if (!stop && !asJson) console.error(stalled ? `watch: no stream bytes for ${DRAFTY_WATCH_STALL_MS}ms` : `watch: ${e?.message ?? e}`);
     } finally {
+      if (stallTimer) clearTimeout(stallTimer);
       if (renew) clearInterval(renew);
       streamAbort = null;
     }
     if (stop) break;
-    const delay = Math.min(1000 * 2 ** attempt++, 10000); // backoff, capped 10s
+    const baseDelay = Math.min(1000 * 2 ** attempt++, 10000); // exponential backoff, capped 10s
+    const delay = Math.round(baseDelay * (0.8 + Math.random() * 0.4)); // ±20% reconnect jitter
     if (!asJson) console.error(`… stream closed (host duration cap or network); reconnecting in ${delay}ms — the doorbell stays armed`);
     await new Promise((r) => setTimeout(r, delay));
   }

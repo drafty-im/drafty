@@ -9,14 +9,34 @@ import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 type Call = { path: string; body: Record<string, unknown> };
+type WatchCall = { scenario: string; url: string };
 const calls: Call[] = [];
+const watchCalls: WatchCall[] = [];
 const streams = new Set<ServerResponse>();
 const keepalives = new Map<ServerResponse, ReturnType<typeof setInterval>>();
+let watchScenario = "steady";
 
 const server = createServer((req, res) => {
-  const path = new URL(req.url || "/", "http://localhost").pathname;
+  const requestUrl = new URL(req.url || "/", "http://localhost");
+  const path = requestUrl.pathname;
   if (path === "/get/api/comments.watch") {
+    const scenario = watchScenario;
+    watchCalls.push({ scenario, url: requestUrl.toString() });
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+    res.flushHeaders();
+    const scenarioAttempt = watchCalls.filter((call) => call.scenario === scenario).length;
+    if (scenario.includes("cursor-") && scenarioAttempt === 1) {
+      for (const createdAt of [1_700_000_000_001, 1_700_000_000_003, 1_700_000_000_002]) {
+        res.write(`data: ${JSON.stringify({ ev: "comment", slug: "cursor-canvas", annotationId: `ann-${createdAt}`, author: "stub", body: "cursor", createdAt })}\n\n`);
+      }
+      setTimeout(() => res.end(), 5);
+      return;
+    }
+    if (scenario.endsWith("-stall") && scenarioAttempt === 1) {
+      streams.add(res);
+      res.on("close", () => { streams.delete(res); });
+      return;
+    }
     res.write(": connected\n\n");
     streams.add(res);
     keepalives.set(res, setInterval(() => res.write(": keepalive\n\n"), 10));
@@ -137,6 +157,24 @@ try {
     await run(runtime, home, ["comments", "watch", "--live", "--json", "--for", "40ms"], { DRAFTY_HANDLER_ID: "daemon:stub" });
     expect(!calls.slice(start).some((call) => call.path === "/get/api/canvas.heartbeat"), `${runtime}: --live must not heartbeat`);
 
+    for (const live of [false, true]) {
+      watchScenario = `${runtime}-${live ? "cursor-live" : "cursor-slug"}`;
+      const watchStart = watchCalls.length;
+      await run(runtime, home, ["comments", "watch", ...(live ? ["--live"] : ["cursor-canvas"]), "--json", "--for", "1800ms"]);
+      const reconnects = watchCalls.slice(watchStart).map((call) => new URL(call.url));
+      expect(reconnects.length >= 2, `${runtime}: ${live ? "live" : "slug"} cursor stream did not reconnect`);
+      expect(!reconnects[0].searchParams.has("since"), `${runtime}: first ${live ? "live" : "slug"} connect unexpectedly sent since`);
+      expect(reconnects[1].searchParams.get("since") === "1700000000003", `${runtime}: ${live ? "live" : "slug"} reconnect did not send the max createdAt`);
+    }
+
+    watchScenario = `${runtime}-stall`;
+    const stallStart = watchCalls.length;
+    await run(runtime, home, ["comments", "watch", "stall-canvas", "--json", "--for", "1800ms"], { DRAFTY_WATCH_STALL_MS: "25" });
+    const stallReconnects = watchCalls.slice(stallStart).map((call) => new URL(call.url));
+    expect(stallReconnects.length >= 2, `${runtime}: byte-silent stream was not aborted and reconnected`);
+    expect(!stallReconnects[0].searchParams.has("since"), `${runtime}: first stalled-stream connect unexpectedly sent since`);
+    watchScenario = "steady";
+
     await run(runtime, home, ["comments", "working", "ann-daemon"], {
       DRAFTY_HANDLER_ID: "daemon:stub",
       CLAUDE_CODE_SESSION_ID: "ignored-session",
@@ -168,7 +206,7 @@ try {
     expect(sessionReply?.body.handlerId === `session:session-456@${hostname()}`, `${runtime}: session handlerId missing on comments.reply`);
     expect(push?.body.handlerId === "daemon:stub", `${runtime}: handlerId missing on canvas.push`);
     expect(!Object.hasOwn(anonWorking?.body ?? {}, "handlerId"), `${runtime}: anonymous touch should omit handlerId`);
-    console.log(`  ✓ ${runtime}: claim commands, watch lifecycle, touch payloads, and repo write-through`);
+    console.log(`  ✓ ${runtime}: claims, reconnect cursors, stall watchdog, touch payloads, and repo write-through`);
     rmSync(home, { recursive: true, force: true });
   }
 } finally {
