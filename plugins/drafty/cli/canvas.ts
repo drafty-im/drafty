@@ -1840,7 +1840,7 @@ async function commentsInbox(args: string[]) {
 // success, not a failure (the old "wrap it in `timeout`" path died with 127 on
 // macOS, which has no `timeout`). The SSE loop keeps the process alive, so the
 // timer reliably fires; unref'd so it can never itself hold exit open.
-async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (ev: any) => void) {
+async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (ev: any) => void, live = false) {
   const token = await getToken();
   const forRaw = flag(args, "for") ?? flag(args, "timeout");
   if (forRaw !== undefined) {
@@ -1865,7 +1865,10 @@ async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (e
   // --backlog; reconnects start fresh so old events aren't replayed.
   let attempt = 0;
   while (!stop) {
-    const qs = new URLSearchParams({ slug, ...(has(args, "backlog") && attempt === 0 ? { backlog: "1" } : {}) });
+    // --live streams comments for ALL the creator's live canvases over one
+    // connection: send scope=live in lieu of a slug (the server resolves the
+    // creator from the auth token and multiplexes; each event carries its slug).
+    const qs = new URLSearchParams({ ...(live ? { scope: "live" } : { slug }), ...(has(args, "backlog") && attempt === 0 ? { backlog: "1" } : {}) });
     try {
       const res = await fetch(`${BASE_URL}/get/api/comments.watch?${qs}`, {
         headers: { authorization: `Bearer ${token}`, accept: "text/event-stream" },
@@ -1904,9 +1907,36 @@ async function watchLoop(slug: string, args: string[], asJson: boolean, onEv: (e
 }
 
 async function commentsWatch(args: string[]) {
+  const asJson = has(args, "json");
+  const live = has(args, "live");
+  const slugArg = args[0] && !args[0].startsWith("--") ? args[0] : undefined;
+
+  // --live and a <slug> are mutually exclusive: --live streams comments from
+  // EVERY canvas the creator has live (scope=live in lieu of a slug), each event
+  // tagged with its own slug. A slug watch stays exactly as before.
+  if (live && slugArg) return die("comments watch: pass a <slug> OR --live, not both — --live streams every one of your live canvases over one connection");
+
+  if (live) {
+    // scope=live has no guest mode: the server scopes to the creator behind the
+    // auth token, so a signed-out watch can't be resolved. Fail fast + specific.
+    try { await getToken(); }
+    catch { return die("comments watch --live needs a signed-in creator — scope=live streams your own live canvases (no guest mode). Run `drafty login` first."); }
+    if (!asJson) console.error(`👀 watching every canvas you have live — new comments appear here, each tagged with its canvas slug\n`);
+    await watchLoop("", args, asJson, (ev) => {
+      if (ev.ev !== "comment") return;
+      if (asJson) {
+        console.log(JSON.stringify({ slug: ev.slug ?? null, annotationId: ev.annotationId, anchorTag: ev.anchorTag, anchorText: ev.anchorText, anchors: ev.anchors ?? null, anchorFx: ev.anchorFx ?? null, anchorFy: ev.anchorFy ?? null, status: ev.status, author: ev.author, body: ev.body, createdAt: ev.createdAt }));
+      } else {
+        console.log(`[${shortTime(ev.createdAt)}] [${ev.slug ?? "?"}] ${ev.author} on ${anchorLabel(ev)}`);
+        console.log(`  ${ev.body}`);
+        console.log(`  ↳ reply: drafty comments reply ${ev.annotationId} "..."   resolve: drafty comments resolve ${ev.annotationId}\n`);
+      }
+    }, true);
+    return;
+  }
+
   const slug = await resolveSlug(args[0]);
   if (!slug) return die("usage: drafty comments watch <slug> [--json] [--backlog] [--for DURATION]");
-  const asJson = has(args, "json");
   if (!asJson) console.error(`👀 watching ${url(slug)} — new comments will appear here\n`);
   await watchLoop(slug, args, asJson, (ev) => {
     if (ev.ev !== "comment") return;
@@ -2810,6 +2840,7 @@ COMMENTS — threads pinned to a canvas, and their replies
   drafty comments ls <slug> [--json] [--open]   threads + replies on a canvas
   drafty comments inbox [slug] [--json] [--all]   fresh threads that need Claude
   drafty comments watch <slug> [--json] [--backlog] [--for DUR]   stream new comments live (SSE doorbell); --for 20m self-exits, no external timeout needed
+  drafty comments watch --live [--json] [--for DUR]   stream comments from EVERY canvas you have live over ONE connection; each event is tagged with its slug (run in one comms session)
   drafty comments create <slug> --anchor "<text>" [--at fx,fy] "<msg>"   open a NEW thread as Claude (--canvas for an unanchored note)
   drafty comments reply <annotationId> "<message>"   reply in a thread as Claude
   drafty comments working <annotationId>      shimmer the thread while you work on it
