@@ -5,12 +5,13 @@
 **[Drafty](https://drafty.im)** is the review layer for AI-drafted work. Your agent writes a plan, a spec, a page — you share it as a link, then click any element and leave a note, Figma-style. Every comment becomes your agent's next edit, on the same link, with history. No screenshots, no re-pasting "the third paragraph, the one about pricing." This repo is the **Claude Code plugin** that runs the loop end to end.
 
 ```
-/plugin marketplace add drafty-im/drafty
-/plugin install drafty@drafty-im
-/reload-plugins
+claude plugin marketplace add drafty-im/drafty
+claude plugin install drafty@drafty-im
 ```
 
-Or just ask in a Claude Code session — *"install the drafty-im/drafty plugin"* — and Claude runs those for you. `/reload-plugins` switches everything on live (the `drafty` skill and the `drafty` command on PATH), no restart. Runs on Node 22.18+ or [bun](https://bun.sh) — whichever is already on PATH, no build step. Sign in once with `drafty login` — Claude prompts you the first time you publish.
+Then run `/reload-plugins` (or restart) so the `drafty` skill and command load. Or paste into Claude: `fetch https://drafty.im/connect.md and follow it` — install, sign-in, and first canvas in one go.
+
+Or just ask in a Claude Code session — *"install the drafty-im/drafty plugin"* — and Claude runs those for you. Runs on Node 22.18+ or [bun](https://bun.sh) — whichever is already on PATH, no build step. Sign in once with `drafty login` — Claude prompts you the first time you publish.
 
 ## Capabilities
 
@@ -19,7 +20,7 @@ Or just ask in a Claude Code session — *"install the drafty-im/drafty plugin"*
 - **Agent eyes.** `drafty shot` renders a canvas, a local HTML file, or any URL to an image so Claude can *see* what it built — including a commenter's exact view (their viewport width, their revision, the anchored element highlighted) instead of guessing at "looks squished on my phone" from text alone.
 - **Site boards.** `drafty present <url>` maps a site (robots → sitemap → homepage links), curates the main screens, captures each at desktop + phone width with local Chrome, and publishes an annotatable board. `--refresh` re-shoots the same screens as a tick — competitor tracking, staging watch.
 - **Versioned, with a real undo.** Every push snapshots a revision. `revert` rolls the canvas back AND resyncs the local file atomically; `status` reports in-sync / local-ahead / canvas-ahead / diverged; a push that would clobber an edit made elsewhere (browser, another agent) is refused with instructions, never silently applied.
-- **Organized, and self-tidying.** Projects, tags, pin, archive — and `drafty sweep` cross-references your canvases against the repo's git log to flag the ones whose work already shipped, so finished specs get receipted and archived instead of rotting on the list.
+- **Organized, and self-tidying.** Projects, tags, pin, archive — and `drafty tidy --sweep` cross-references your canvases against the repo's git log to flag the ones whose work already shipped, so finished specs get receipted and archived instead of rotting on the list.
 - **Self-refreshing dashboards.** The bundled `drafty-cron` skill wires a plain OS cron — no model, no credits at runtime — that re-renders and pushes a data-backed canvas on a timer.
 
 ## How it works
@@ -88,14 +89,13 @@ Claude drives these; the reference is here so you can audit what it's doing.
 |---|---|
 | `drafty shot <slug\|file.html\|url> [--width N] [--annotation A] [--full]` | Render to an image, print the path. `--annotation` reproduces a commenter's exact view. Local files/URLs and private canvases render with your own headless Chrome; public canvases use the server's cached render. |
 | `drafty present <url> [--screens N] [--urls …] [--slug S --refresh] [--dry-run]` | Site board: map → curate (≤20 screens) → shoot at 1280+390px → publish annotatable board. |
-| `drafty marks ls / rm` | Row-level "done/saved" state humans set on live canvases — refresh scripts read it back. |
 
 **Session**
 
 | Command | What it does |
 |---|---|
 | `drafty context` | One-shot orientation: identity, git repo/branch, projects + tags in use, recent canvases, sweep nudge. |
-| `drafty sweep [--project P]` | Evidence for which canvases look shipped (slug in a commit after last update) or stale. |
+| `drafty tidy [--sweep] [--project P]` | One audit pass: unfiled canvases, junk titles, tag drift; `--sweep` flags which look shipped (slug in a commit after last update) or stale. |
 | `drafty changelog` | What shipped on Drafty, by week. |
 | `drafty login / logout / whoami / doctor` | Browser sign-in, identity, environment preflight. |
 

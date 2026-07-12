@@ -2630,7 +2630,7 @@ function openBrowser(url: string) {
 function logout() {
   if (existsSync(TOKEN_FILE)) rmSync(TOKEN_FILE, { force: true });
   clearIdentity(); // explicit sign-out — drop the marker so we don't warn about it
-  console.error("✓ signed out — a new guest identity will be created on next use");
+  console.error("✓ signed out — run `drafty login` before the next command");
 }
 
 // ── setup / health ────────────────────────────────────────────────────────────
@@ -2846,8 +2846,9 @@ LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
 Any <slug> above also accepts a full ${BASE_URL}/canvas/<slug> URL or a
 ${BASE_URL}/l/<code> short link — paste what you have, no need to extract the slug.
 
-Identity starts as a guest token (stored in ~/.drafty); \`drafty login\` upgrades
-it into a real account in place. Point at another server with DRAFTY_BASE_URL.
+Auth is required: run \`drafty login\` (browser handback) before publishing.
+Guest mode exists only in the no-install demo at drafty.im/get — not in this CLI.
+Session token is stored in ~/.drafty. Point at another server with DRAFTY_BASE_URL.
 `;
 
 // Namespaced verb tables — `drafty <namespace> <verb> [args]`. The namespace
