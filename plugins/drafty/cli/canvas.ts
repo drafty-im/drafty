@@ -24,9 +24,9 @@ const BASE_URL = process.env.DRAFTY_BASE_URL || "https://drafty.im";
 const STATE_DIR = process.env.DRAFTY_STATE_DIR || join(homedir(), ".drafty");
 const TOKEN_FILE = join(STATE_DIR, "token");
 // A durable marker of the last signed-in identity, kept alongside the token.
-// If the token ever goes missing while this says we were signed in, we make the
-// drop-to-guest LOUD instead of silent (see getToken / main) — so a lost session
-// can never quietly publish under a throwaway guest.
+// If the token ever goes missing while this says we were signed in, we say so
+// LOUDLY instead of failing vaguely (see getToken / main) — a lost session asks
+// for `drafty login` again rather than quietly publishing as someone else.
 const IDENTITY_FILE = join(STATE_DIR, "identity.json");
 type Identity = { signedIn?: boolean; email?: string; userId?: string; sessionLost?: boolean };
 
@@ -367,9 +367,9 @@ async function resolveSlug(input: string | undefined): Promise<string> {
 }
 
 // ── transport ────────────────────────────────────────────────────────────────
-// Establish (or restore) this machine's guest identity. The server mints a real
-// Instant guest and hands back its refresh token; we store the opaque string and
-// send it as a Bearer. No InstantDB client here.
+// Restore this machine's account token — written by `drafty login`, stored as an
+// opaque string under ~/.drafty and sent as a Bearer. Nothing is minted here: with
+// no stored token we ask the human to sign in. No InstantDB client here.
 async function getToken(): Promise<string> {
   if (existsSync(TOKEN_FILE)) {
     const t = readFileSync(TOKEN_FILE, "utf8").trim();
@@ -2846,9 +2846,10 @@ LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
 Any <slug> above also accepts a full ${BASE_URL}/canvas/<slug> URL or a
 ${BASE_URL}/l/<code> short link — paste what you have, no need to extract the slug.
 
-Sign in first — \`drafty login\` (browser handback, token stored in ~/.drafty). Plugin
-commands run on your real account; there is no guest mode here (that's the no-install
-demo at ${BASE_URL}/get). Point at another server with DRAFTY_BASE_URL.
+Sign in first — \`drafty login\` (browser handback, token stored in ~/.drafty). The
+plugin never mints an anonymous identity: with no stored login, every command just
+says "Not signed in" (guest mode lives only in the no-install demo at ${BASE_URL}/get).
+Point at another server with DRAFTY_BASE_URL.
 `;
 
 // Namespaced verb tables — `drafty <namespace> <verb> [args]`. The namespace
