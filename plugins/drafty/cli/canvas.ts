@@ -2,7 +2,7 @@
 // drafty CLI — publish canvases to drafty.im/canvas/<slug>, then read and reply to
 // feedback as Claude.
 //
-// A thin HTTP/SSE client: it holds a per-user guest token (minted by the server,
+// A thin HTTP/SSE client: it holds the user's account token (from `drafty login`,
 // stored under ~/.drafty) and drives everything through the public /get/api
 // endpoints. No InstantDB dependency, no native deps — installs anywhere.
 //
@@ -2626,11 +2626,11 @@ function openBrowser(url: string) {
   try { spawn(cmd[0], cmd.slice(1), { stdio: "ignore", detached: true }).unref(); } catch { /* user can click the printed URL */ }
 }
 
-// Drop the stored identity; the next command mints a fresh guest.
+// Drop the stored identity; every command then asks for `drafty login` again.
 function logout() {
   if (existsSync(TOKEN_FILE)) rmSync(TOKEN_FILE, { force: true });
   clearIdentity(); // explicit sign-out — drop the marker so we don't warn about it
-  console.error("✓ signed out — a new guest identity will be created on next use");
+  console.error("✓ signed out — run `drafty login` to sign back in");
 }
 
 // ── setup / health ────────────────────────────────────────────────────────────
@@ -2846,8 +2846,9 @@ LINKS — short tracked links (drafty.im/l/<code>) with attribution baked in
 Any <slug> above also accepts a full ${BASE_URL}/canvas/<slug> URL or a
 ${BASE_URL}/l/<code> short link — paste what you have, no need to extract the slug.
 
-Identity starts as a guest token (stored in ~/.drafty); \`drafty login\` upgrades
-it into a real account in place. Point at another server with DRAFTY_BASE_URL.
+Sign in first — \`drafty login\` (browser handback, token stored in ~/.drafty). Plugin
+commands run on your real account; there is no guest mode here (that's the no-install
+demo at ${BASE_URL}/get). Point at another server with DRAFTY_BASE_URL.
 `;
 
 // Namespaced verb tables — `drafty <namespace> <verb> [args]`. The namespace
