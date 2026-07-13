@@ -146,6 +146,7 @@ the update unprompted, since it changes their environment.
 | `drafty canvas visibility <slug> <public\|authed\|invite\|private>` | Set **who can view** it (orthogonal to mode, which is who can *comment*). `public` = anyone with the link (default); `authed` = any signed-in account; `invite`/`private` = the owner + invited emails only — server-enforced, so a private canvas's content is **not** served to anyone else. Use `--private` on `push` to publish straight to owner-only. |
 | `drafty comments ls <slug> [--json] [--open]` | Snapshot every thread + comment (your reading view). `--open` hides resolved. |
 | `drafty comments watch <slug> [--json] [--backlog]` | **Socket mode** — stream new human comments live to stdout. Run in background; surface comments to the user as they arrive. |
+| `drafty comments watch --live [--json]` | **Socket mode, multiplexed** — one connection streams new comments from *every* canvas you have `live`; each event carries its own `slug`. No per-canvas enumeration or re-arm. Interim: run in **at most one** (comms) session — see the re-arm note below. |
 | `drafty comments inbox [slug] [--json] [--all]` | **Fresh threads that need Claude** — open, not already being worked on, latest comment from a human. Loop-safe (resolved/answered threads never reappear). A no-slug sweep only surfaces canvases set to `live`; pass a `slug` or `--all` to include `feedback` canvases too. |
 | `drafty comments working <annotationId>` | Shimmer the thread on the canvas while you work on it. Stays on through replies; cleared by resolve/reopen (or after 10 min idle). |
 | `drafty comments create <slug> --anchor "<text>" [--at <fx>,<fy>] "<msg>"` | **Open a NEW thread as Claude** — the create counterpart to reply. `--anchor "<text>"` pins it to the element whose text best matches (server resolves by fuzzy/token match and **hard-errors on a weak OR ambiguous match**, so a vague query never lands on the wrong element — pass distinctive element text, enough to be unique); `--at <fx>,<fy>` adds a point inside it (0..1 — pin on a screenshot in a `present` board); `--canvas` makes it an unanchored canvas-level note. This is how Claude leaves a pointed first-pass review, or layers analysis onto a board — and it survives a board `--refresh` (annotations are separate data, re-anchored on re-push). |
@@ -244,6 +245,14 @@ watch doorbell for that canvas (`Monitor` on `drafty comments watch <slug> --jso
 - **On session start, re-arm watches for every canvas currently in `live` mode**
   (check `drafty canvas ls`), so "live" survives across sessions. While you're not
   running, the canvas honestly shows "Claude offline" and comments queue.
+- **Preferred now: one `drafty comments watch --live --json` for the whole account.**
+  A single connection streams comments from *every* canvas you have `live`, each event
+  tagged with its `slug` — so you no longer enumerate canvases or re-arm a watch per
+  canvas. **Interim caveat:** until claim arbitration ships (a later phase), run `--live`
+  in **at most one session** — a designated *comms* session — so exactly one listener
+  wakes per comment (otherwise every listening session wakes for every comment). The
+  per-canvas re-arm ritual above still works and is **not** retired yet — that retirement
+  rides the daemon in a later phase; `--live` is just the better path today.
 
 ## Organizing canvases (project · tags · archive)
 
